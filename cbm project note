@@ -1,84 +1,303 @@
-I have built a Python desktop application using Tkinter for CBM (Coalbed Methane) well data analytics. The application currently performs clustering, anomaly detection, PCA visualization, 3D reservoir visualization, and production analysis.
+Below is a **corrected, clean, and complete project document** explaining your app properly. It includes **problem statement, workflow, parameters from uploaded data, clustering, hidden patterns, graphs, and AI techniques**.
 
-I want to improve the application by adding new analytical features and simplifying the UI. Please modify the existing code accordingly.
+---
 
-1. Parameter-Based Clustering
-   Add a section where the parameters used for clustering are clearly defined. The clustering should be based on selected well parameters such as:
+# CBM Production Pattern Discovery Using AI
+
+## Project Documentation
+
+---
+
+# 1. Introduction
+
+Coalbed Methane (CBM) is a natural gas stored in underground coal seams. CBM wells produce methane gas along with water, and the production behavior of each well depends on several reservoir and operational parameters such as pressure, permeability, coal thickness, and water production.
+
+In modern CBM fields, a large amount of well data is collected continuously. Analyzing this data manually to identify production patterns, reservoir characteristics, and abnormal wells is difficult and time-consuming.
+
+This project develops an AI-based analytics application that analyzes CBM well datasets and automatically discovers hidden patterns using machine learning techniques.
+
+---
+
+# 2. Problem Statement
+
+CBM reservoirs consist of many wells with different geological and operational conditions. Engineers must analyze large datasets containing well parameters such as production rate, reservoir pressure, permeability, and water production.
+
+The main challenges include:
+
+* Large datasets make manual analysis difficult
+* Hidden relationships between parameters are not easily visible
+* Abnormal wells may go undetected
+* Production patterns across wells are difficult to identify
+
+Therefore, there is a need for an intelligent system that can automatically analyze well datasets and identify meaningful production patterns.
+
+---
+
+# 3. Objective of the Project
+
+The objective of this project is to develop a CBM analytics application that can:
+
+* Analyze well datasets automatically
+* Group wells with similar behavior
+* Detect abnormal wells
+* Visualize reservoir and production patterns
+* Provide insights for engineers
+
+---
+
+# 4. System Overview
+
+The application is a desktop system developed using Python and Tkinter. It allows users to upload CBM well datasets and perform AI-based analysis.
+
+The system performs the following tasks:
+
+* Load well dataset
+* Identify parameters from uploaded data
+* Allow feature selection
+* Perform clustering analysis
+* Detect hidden patterns
+* Visualize data through graphs
+* Generate AI insights report
+
+---
+
+# 5. Parameters Used for Analysis
+
+The parameters used in the system are not fixed. Instead, they are automatically extracted from the dataset uploaded by the user.
+
+When a dataset is uploaded, the application reads all columns and identifies numerical parameters that can be used for machine learning analysis.
+
+Example dataset parameters:
+
+| Parameter             | Description                             |
+| --------------------- | --------------------------------------- |
+| Reservoir Pressure    | Pressure inside the coal seam reservoir |
+| Gas Production Rate   | Amount of methane produced per day      |
+| Water Production Rate | Amount of water produced with gas       |
+| Permeability          | Ability of coal seam to allow gas flow  |
+| Coal Thickness        | Thickness of the coal seam              |
+| Fracture Count        | Number of fractures affecting gas flow  |
+| Pump Speed            | Pump speed controlling water removal    |
+| Temperature           | Reservoir temperature                   |
+
+These parameters describe reservoir characteristics and well performance.
+
+---
+
+# 6. Project Workflow
+
+The working process of the application follows these steps:
+
+1. Upload CBM well dataset
+2. System detects parameters automatically
+3. User selects parameters for analysis
+4. Data normalization is performed
+5. Clustering algorithm groups similar wells
+6. Hidden pattern detection identifies abnormal wells
+7. Graphs visualize reservoir patterns
+8. AI insights report summarizes results
+
+---
+
+# 7. Run Analysis Function
+
+The **Run Analysis** button starts the machine learning pipeline.
+
+When this button is pressed, the system performs the following operations:
+
+1. Extract selected parameters from the dataset
+2. Normalize the dataset to maintain equal scale for all parameters
+3. Apply clustering algorithm
+4. Detect anomalies in well behavior
+5. Generate graphs and visualizations
+6. Produce an automated insights report
+
+This allows the system to automatically analyze the entire well dataset.
+
+---
+
+# 8. Machine Learning Techniques Used
+
+The application uses multiple machine learning techniques.
+
+---
+
+## 8.1 Clustering Algorithm
+
+The system uses **K-means clustering** to group wells with similar behavior.
+
+Clustering helps identify production patterns among wells.
+
+### How Clustering Works
+
+1. The user selects the number of clusters
+2. The algorithm creates cluster centers
+3. Each well is assigned to the nearest cluster
+4. Cluster centers are updated
+5. The process repeats until clusters stabilize
+
+Example clustering result:
+
+| Well | Cluster   |
+| ---- | --------- |
+| W1   | Cluster 1 |
+| W2   | Cluster 1 |
+| W3   | Cluster 2 |
+| W4   | Cluster 3 |
+
+Each cluster represents a group of wells with similar characteristics.
+
+---
+
+# 9. Hidden Pattern Detection
+
+After clustering, the system identifies abnormal wells using anomaly detection algorithms.
+
+The application uses:
+
+* **Isolation Forest**
+* **Local Outlier Factor**
+
+These algorithms detect wells whose behavior differs significantly from other wells.
+
+---
+
+# 10. Reasons for Hidden Patterns
+
+Hidden patterns may occur due to:
+
+* Reservoir heterogeneity
+* Geological faults
+* Water breakthrough
+* Abnormal reservoir pressure
+* Equipment malfunction
+* Pump failure
+* Operational changes
+
+These wells are marked as anomalies in the hidden pattern visualization.
+
+---
+
+# 11. Why Isolation Forest and LOF Are Used
+
+Different anomaly detection algorithms identify different types of abnormal behavior.
+
+### Isolation Forest
+
+* Detects anomalies by isolating unusual data points
+* Works efficiently for large datasets
+* Fast and scalable
+
+### Local Outlier Factor
+
+* Detects anomalies based on density of neighboring data points
+* Useful for detecting local anomalies
+
+Using both methods increases reliability in identifying unusual wells.
+
+---
+
+# 12. Visualization Graphs in the Application
+
+The application generates several graphs to understand reservoir behavior.
+
+---
+
+## 12.1 Cluster Visualization
+
+Displays wells grouped into clusters.
+
+Each color represents a different cluster.
+
+This helps identify production patterns among wells.
+
+---
+
+## 12.2 PCA Visualization
+
+Uses **Principal Component Analysis**.
+
+PCA reduces many parameters into two main components so complex well data can be visualized in two dimensions.
+
+Clusters appear clearly in this graph.
+
+---
+
+## 12.3 3D Reservoir Visualization
+
+Displays wells in three-dimensional space using three parameters.
+
+Example axes:
 
 * Reservoir Pressure
 * Gas Production Rate
 * Water Production Rate
-* Permeability
-* Coal Thickness
-* Fracture Count
-* Pump Speed
-* Temperature
 
-2. Parameter Weightage
-   Allow assigning weightage to parameters before clustering. For example:
+This helps understand spatial relationships between wells.
 
-* Gas Production Rate → 30%
-* Reservoir Pressure → 20%
-* Permeability → 15%
-* Coal Thickness → 10%
-* Water Production Rate → 10%
-* Fracture Count → 5%
-* Pump Speed → 5%
-* Temperature → 5%
+---
 
-The clustering algorithm should consider these weights when calculating similarity between wells.
+## 12.4 Production Curve Analysis
 
-3. Event-Based Analysis
-   Add support for operational events in the dataset such as:
+Shows production behavior of wells within clusters.
 
-* Well ON
-* Well OFF
-* Maintenance Shutdown
-* Pump Failure
-* Water Breakthrough
+Helps identify:
 
-These events should influence clustering and anomaly detection. For example:
+* high production wells
+* declining wells
+* unstable wells
 
-* Wells that are OFF should not be treated the same as active wells.
-* Sudden ON/OFF changes should be flagged as operational anomalies.
+---
 
-4. Event Detection Panel
-   Add a panel in the dashboard that shows:
+## 12.5 Hidden Pattern Graph
 
-* number of active wells
-* number of inactive wells
-* wells with abnormal operational patterns
+Displays normal wells and anomalous wells.
 
-5. Simplify Export Options
-   Currently there are many export buttons. Remove all of them except one single export option:
+Normal wells appear as blue points.
+Anomalous wells appear as red markers.
 
-Export Results
+These represent wells with unusual behavior.
 
-This button should export:
+---
 
-* clustered dataset
-* anomaly wells
-* insights report
-* cluster labels
+# 13. Output of the System
 
-All exported in a single file (CSV or Excel).
+The application produces the following outputs:
 
-6. Dashboard Improvements
-   The dashboard should clearly show:
+* Clustered well dataset
+* Reservoir pattern visualization
+* Production analysis graphs
+* Hidden anomaly detection
+* AI-generated insights report
 
-* clusters and their meaning
-* parameter importance
-* hidden pattern explanation
-* event summary (ON/OFF wells)
+These outputs help engineers understand well performance and reservoir behavior.
 
-7. Code Structure
-   Keep the existing architecture but refactor where necessary. Maintain separate modules for:
+---
 
-* data loading
-* clustering
-* anomaly detection
-* visualization
+# 14. Benefits of the System
 
-Make sure the UI remains clean and readable.
+The CBM AI analytics platform provides several advantages:
 
-Return the updated Python code for the application with these improvements.
+* Faster analysis of large well datasets
+* Automatic discovery of production patterns
+* Early detection of abnormal wells
+* Improved reservoir understanding
+* Better decision-making for production optimization
+
+---
+
+# 15. Conclusion
+
+This project demonstrates how artificial intelligence and machine learning techniques can be used to analyze CBM well data and discover hidden patterns in reservoir behavior.
+
+By combining clustering, anomaly detection, and visualization techniques, the system provides an intelligent platform for understanding well performance and identifying production patterns.
+
+Such systems can significantly improve reservoir management and methane production efficiency.
+
+---
+
+If you want, I can also help you add **one extremely important section missing from this report**:
+
+**“Event-Based Analysis (Well ON/OFF, Pump Failure, Water Breakthrough)”**
+
+Adding that will make your project look **much closer to real oil & gas industry analytics systems.**
