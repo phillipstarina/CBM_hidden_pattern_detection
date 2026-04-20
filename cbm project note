@@ -1,0 +1,84 @@
+I have built a Python desktop application using Tkinter for CBM (Coalbed Methane) well data analytics. The application currently performs clustering, anomaly detection, PCA visualization, 3D reservoir visualization, and production analysis.
+
+I want to improve the application by adding new analytical features and simplifying the UI. Please modify the existing code accordingly.
+
+1. Parameter-Based Clustering
+   Add a section where the parameters used for clustering are clearly defined. The clustering should be based on selected well parameters such as:
+
+* Reservoir Pressure
+* Gas Production Rate
+* Water Production Rate
+* Permeability
+* Coal Thickness
+* Fracture Count
+* Pump Speed
+* Temperature
+
+2. Parameter Weightage
+   Allow assigning weightage to parameters before clustering. For example:
+
+* Gas Production Rate → 30%
+* Reservoir Pressure → 20%
+* Permeability → 15%
+* Coal Thickness → 10%
+* Water Production Rate → 10%
+* Fracture Count → 5%
+* Pump Speed → 5%
+* Temperature → 5%
+
+The clustering algorithm should consider these weights when calculating similarity between wells.
+
+3. Event-Based Analysis
+   Add support for operational events in the dataset such as:
+
+* Well ON
+* Well OFF
+* Maintenance Shutdown
+* Pump Failure
+* Water Breakthrough
+
+These events should influence clustering and anomaly detection. For example:
+
+* Wells that are OFF should not be treated the same as active wells.
+* Sudden ON/OFF changes should be flagged as operational anomalies.
+
+4. Event Detection Panel
+   Add a panel in the dashboard that shows:
+
+* number of active wells
+* number of inactive wells
+* wells with abnormal operational patterns
+
+5. Simplify Export Options
+   Currently there are many export buttons. Remove all of them except one single export option:
+
+Export Results
+
+This button should export:
+
+* clustered dataset
+* anomaly wells
+* insights report
+* cluster labels
+
+All exported in a single file (CSV or Excel).
+
+6. Dashboard Improvements
+   The dashboard should clearly show:
+
+* clusters and their meaning
+* parameter importance
+* hidden pattern explanation
+* event summary (ON/OFF wells)
+
+7. Code Structure
+   Keep the existing architecture but refactor where necessary. Maintain separate modules for:
+
+* data loading
+* clustering
+* anomaly detection
+* visualization
+
+Make sure the UI remains clean and readable.
+
+Return the updated Python code for the application with these improvements.
