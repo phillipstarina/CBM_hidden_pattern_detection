@@ -1,0 +1,2 @@
+pip install pandas numpy matplotlib scikit-learn ttkbootstrap openpyxl pandas-access
+sudo apt install mdbtools
