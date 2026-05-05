@@ -1,27 +1,18 @@
 """
-CBM AI Analytics Platform — v6.0
+CBM AI Analytics Platform — v7.0
 ─────────────────────────────────────────────
-NEW in v6.0:
-• LEFT SIDEBAR — Feature Selection Panel:
-  - Numeric columns: checkboxes with search/filter
-  - Categorical columns: checkboxes for grouping/event detection
-  - "Select All / Clear All" buttons
-  - Live count of selected features
-• WELL-BASED CLUSTERING (fast + meaningful):
-  - Groups all records by well ID before clustering
-  - Aggregates per-well stats (mean, std, min, max, p25, p75)
-  - Clusters on WELL PROFILES (not raw records)
-  - Much faster on huge datasets (e.g. 300k rows → 287 well vectors)
-• PARAMETER SIMILARITY:
-  - New "Similarity" tab: correlation heatmap + cosine similarity matrix
-  - Shows which parameters behave alike across wells
-  - Highlights redundant features and unique signals
-• FAST LOADING:
-  - Chunked CSV reader for huge files
-  - Dask fallback for files > 500 MB
-  - Streaming preview (first 50k rows for display)
-  - Background thread for all I/O + analysis
-• Everything from v5.1 retained and enhanced
+CHANGES FROM v6.2:
+• REMOVED: Parameter Weights tab, RPM Status tab,
+           Param Anomaly tab, Similarity tab
+• REMOVED: RPM detection, parameter weight panel (sidebar ④),
+           Z-score threshold panel (sidebar ⑥),
+           RPM filter panel (sidebar ⑦)
+• ENHANCED INSIGHTS: Hidden Pattern section now explains
+  WHICH wells are anomalous, WHICH parameters drove the
+  detection, WHY (z-scores, distributions, median shifts)
+• NEW: AI CHATBOT panel — answers any question about
+  the app, the data, and the analysis results using
+  Claude API (claude-sonnet-4-20250514)
 """
 
 import tkinter as tk
@@ -36,6 +27,8 @@ import threading
 import traceback
 import os
 import datetime
+import json
+import urllib.request
 import matplotlib
 matplotlib.use("TkAgg")
 
@@ -49,166 +42,114 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FAST FILE LOADER — chunked + dask fallback
+# FILE LOADER
 # ══════════════════════════════════════════════════════════════════════════════
-CHUNK_ROWS = 200_000   # rows per chunk for streaming CSV
+CHUNK_ROWS = 200_000
 
 def _get_access_tables_pyodbc(filepath):
     import pyodbc
-    drivers = [d for d in pyodbc.drivers()
-               if 'access' in d.lower() or 'mdb' in d.lower()]
+    drivers = [d for d in pyodbc.drivers() if 'access' in d.lower() or 'mdb' in d.lower()]
     if not drivers:
-        raise RuntimeError(
-            "No Microsoft Access ODBC driver found.\n"
-            "Install: https://www.microsoft.com/en-us/download/details.aspx?id=54920")
-    driver   = drivers[0]
-    conn_str = f"Driver={{{driver}}};Dbq={filepath};Uid=Admin;Pwd=;"
-    conn     = pyodbc.connect(conn_str, timeout=30)
-    cursor   = conn.cursor()
-    tables   = [r.table_name for r in cursor.tables(tableType='TABLE')
-                if not r.table_name.startswith('MSys')]
+        raise RuntimeError("No Microsoft Access ODBC driver found.")
+    driver = drivers[0]
+    conn = pyodbc.connect(f"Driver={{{driver}}};Dbq={filepath};Uid=Admin;Pwd=;", timeout=30)
+    cursor = conn.cursor()
+    tables = [r.table_name for r in cursor.tables(tableType='TABLE')
+              if not r.table_name.startswith('MSys')]
     conn.close()
     return tables, driver
 
-
 def _load_access_table_pyodbc(filepath, table_name, driver):
     import pyodbc, pandas as pd
-    conn_str = f"Driver={{{driver}}};Dbq={filepath};Uid=Admin;Pwd=;"
-    conn     = pyodbc.connect(conn_str, timeout=120)
+    conn = pyodbc.connect(f"Driver={{{driver}}};Dbq={filepath};Uid=Admin;Pwd=;", timeout=120)
     try:
         cursor = conn.cursor()
         cursor.execute(f"SELECT * FROM [{table_name}]")
         columns = [col[0] for col in cursor.description]
-        rows    = cursor.fetchall()
-        df      = pd.DataFrame.from_records(rows, columns=columns)
+        df = pd.DataFrame.from_records(cursor.fetchall(), columns=columns)
         cursor.close()
     except Exception as e:
-        conn.close()
-        raise RuntimeError(f"Could not read table '{table_name}': {e}")
+        conn.close(); raise RuntimeError(f"Could not read table '{table_name}': {e}")
     conn.close()
     return df
 
-
 def _pick_table_dialog(tables, filename):
     result = [tables[0]]
-    dlg = tk.Toplevel()
-    dlg.title(f"Select Table — {filename}")
-    dlg.configure(bg="#0d1117")
-    dlg.resizable(False, False)
-    dlg.grab_set()
-    tk.Label(dlg, text=f"Multiple tables found in:\n{filename}",
-             bg="#0d1117", fg="#e2e8f0", font=("Courier New", 10, "bold"), pady=8).pack(padx=16)
-    lb_frame = tk.Frame(dlg, bg="#0d1117"); lb_frame.pack(padx=16, pady=6, fill="both", expand=True)
+    dlg = tk.Toplevel(); dlg.title(f"Select Table — {filename}")
+    dlg.configure(bg="#0d1117"); dlg.resizable(False, False); dlg.grab_set()
+    tk.Label(dlg, text=f"Tables in {filename}:", bg="#0d1117", fg="#e2e8f0",
+             font=("Courier New", 10, "bold")).pack(padx=16, pady=8)
+    lb_frame = tk.Frame(dlg, bg="#0d1117"); lb_frame.pack(padx=16, pady=4, fill="both")
     sb2 = tk.Scrollbar(lb_frame); sb2.pack(side="right", fill="y")
     lb = tk.Listbox(lb_frame, yscrollcommand=sb2.set, bg="#131b2a", fg="#f1f5f9",
                     selectbackground="#3b82f6", font=("Courier New", 9),
-                    height=min(len(tables), 12), width=42, relief="flat", bd=0)
-    lb.pack(side="left", fill="both", expand=True); sb2.config(command=lb.yview)
+                    height=min(len(tables), 10), width=42, relief="flat", bd=0)
+    lb.pack(side="left", fill="both"); sb2.config(command=lb.yview)
     for t in tables: lb.insert("end", f"  {t}")
     lb.selection_set(0)
     def _ok():
         sel = lb.curselection()
         if sel: result[0] = tables[sel[0]]
         dlg.destroy()
-    tk.Button(dlg, text="Load Selected Table", command=_ok,
-              bg="#1e3a8a", fg="#93c5fd", font=("Courier New", 9, "bold"),
-              relief="flat", bd=0, padx=14, pady=8, cursor="hand2").pack(pady=(4, 14))
+    tk.Button(dlg, text="Load Selected", command=_ok, bg="#1e3a8a", fg="#93c5fd",
+              font=("Courier New", 9, "bold"), relief="flat", padx=14, pady=8,
+              cursor="hand2").pack(pady=(4, 14))
     dlg.wait_window()
     return result[0]
 
-
-def load_access_file(filepath):
-    tables, driver = _get_access_tables_pyodbc(filepath)
-    if not tables:
-        raise RuntimeError("No user tables found in the Access database.")
-    table = tables[0]
-    if len(tables) > 1:
-        table = _pick_table_dialog(tables, os.path.basename(filepath))
-    df = _load_access_table_pyodbc(filepath, table, driver)
-    return df, table
-
-
 def load_any_file(filepath, progress_cb=None):
-    """
-    Fast multi-format loader. Uses chunked reading for large CSVs.
-    progress_cb(pct, msg) — optional callback for progress updates.
-    """
     import pandas as pd
     ext = os.path.splitext(filepath)[1].lower().strip(".")
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
     if ext in ("mdb", "accdb"):
-        df, table = load_access_file(filepath)
-        return df, f"Access table: {table}"
+        tables, driver = _get_access_tables_pyodbc(filepath)
+        if not tables: raise RuntimeError("No user tables found.")
+        table = tables[0] if len(tables) == 1 else _pick_table_dialog(tables, os.path.basename(filepath))
+        return _load_access_table_pyodbc(filepath, table, driver), f"Access: {table}"
 
-    # ── Large CSV: chunked read ────────────────────────────────────────────────
     if ext in ("csv", "tsv", "txt", "") and size_mb > 50:
         sep = "\t" if ext in ("tsv", "txt") else ","
-        chunks = []
-        total_rows = 0
-        try:
-            reader = pd.read_csv(filepath, sep=sep, encoding="utf-8",
-                                 chunksize=CHUNK_ROWS, low_memory=True)
-            for i, chunk in enumerate(reader):
-                chunks.append(chunk)
-                total_rows += len(chunk)
-                if progress_cb:
-                    progress_cb(min(90, i * 5), f"Loading chunk {i+1} ({total_rows:,} rows)…")
-            df = pd.concat(chunks, ignore_index=True)
-            return df, os.path.basename(filepath)
-        except UnicodeDecodeError:
-            chunks = []
-            reader = pd.read_csv(filepath, sep=sep, encoding="latin-1",
-                                 chunksize=CHUNK_ROWS, low_memory=True)
-            for chunk in reader:
-                chunks.append(chunk)
-            df = pd.concat(chunks, ignore_index=True)
-            return df, os.path.basename(filepath)
+        chunks = []; total = 0
+        for enc in ("utf-8", "latin-1"):
+            try:
+                reader = pd.read_csv(filepath, sep=sep, encoding=enc,
+                                     chunksize=CHUNK_ROWS, low_memory=True)
+                for i, chunk in enumerate(reader):
+                    chunks.append(chunk); total += len(chunk)
+                    if progress_cb: progress_cb(min(90, i*5), f"Loaded {total:,} rows…")
+                return pd.concat(chunks, ignore_index=True), os.path.basename(filepath)
+            except UnicodeDecodeError:
+                chunks = []; continue
+        raise RuntimeError("Could not decode file.")
 
-    # ── Standard strategies ────────────────────────────────────────────────────
     strategies = []
     if ext in ("csv", "tsv", "txt", ""):
         sep = "\t" if ext in ("tsv", "txt") else ","
         strategies += [
             lambda f, s=sep: pd.read_csv(f, sep=s, encoding="utf-8", low_memory=False),
             lambda f, s=sep: pd.read_csv(f, sep=s, encoding="latin-1", low_memory=False),
-            lambda f: pd.read_csv(f, sep=None, engine="python", encoding="utf-8"),
+            lambda f: pd.read_csv(f, sep=None, engine="python"),
         ]
-    if ext in ("xlsx", "xlsm", "xlsb", "xls", "ods", "odf", "odt"):
-        engines = []
-        if ext in ("xlsx", "xlsm"): engines += ["openpyxl"]
-        if ext == "xlsb": engines += ["pyxlsb"]
-        if ext == "xls":  engines += ["xlrd"]
-        if ext in ("ods", "odf", "odt"): engines += ["odf"]
-        engines += [None]
-        for eng in engines:
-            if eng:
-                strategies.append(lambda f, e=eng: pd.read_excel(f, engine=e))
-            else:
-                strategies.append(lambda f: pd.read_excel(f))
-    if ext == "json":
-        strategies += [lambda f: pd.read_json(f, orient="records"), lambda f: pd.read_json(f)]
-    if ext == "parquet": strategies += [lambda f: pd.read_parquet(f)]
-    if ext == "feather": strategies += [lambda f: pd.read_feather(f)]
-    if ext in ("h5", "hdf5", "hdf"): strategies += [lambda f: pd.read_hdf(f)]
-    if ext in ("pkl", "pickle"):    strategies += [lambda f: pd.read_pickle(f)]
-    if not strategies:
-        strategies += [lambda f: pd.read_csv(f, encoding="utf-8"),
-                       lambda f: pd.read_csv(f, encoding="latin-1"),
-                       lambda f: pd.read_excel(f)]
-    errors = []
-    for strategy in strategies:
+    if ext in ("xlsx", "xlsm"): strategies += [lambda f: pd.read_excel(f, engine="openpyxl")]
+    if ext == "xlsb":           strategies += [lambda f: pd.read_excel(f, engine="pyxlsb")]
+    if ext == "xls":            strategies += [lambda f: pd.read_excel(f, engine="xlrd")]
+    if ext in ("ods","odf"):    strategies += [lambda f: pd.read_excel(f, engine="odf")]
+    if ext == "json":           strategies += [lambda f: pd.read_json(f, orient="records"),
+                                               lambda f: pd.read_json(f)]
+    if ext == "parquet":        strategies += [lambda f: pd.read_parquet(f)]
+    if ext == "feather":        strategies += [lambda f: pd.read_feather(f)]
+    if ext in ("h5","hdf5"):    strategies += [lambda f: pd.read_hdf(f)]
+    if ext in ("pkl","pickle"): strategies += [lambda f: pd.read_pickle(f)]
+    if not strategies:          strategies += [lambda f: pd.read_csv(f), lambda f: pd.read_excel(f)]
+
+    for s in strategies:
         try:
-            df = strategy(filepath)
+            df = s(filepath)
             if df is not None and len(df.columns) > 0:
                 return df, os.path.basename(filepath)
-        except Exception as e:
-            errors.append(str(e))
-    raise RuntimeError(
-        f"Could not read '{os.path.basename(filepath)}'.\n\n"
-        f"Tried {len(strategies)} strategies.\n"
-        "Supported: CSV, TSV, XLSX, XLS, ODS, JSON, Parquet, Feather, HDF5, Pickle, MDB, ACCDB."
-    )
+        except: pass
+    raise RuntimeError(f"Could not read '{os.path.basename(filepath)}'.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,66 +162,33 @@ plt.rcParams.update({
     "axes.edgecolor":   "#2d3f5e", "grid.color":      "#1e3a5f",
     "axes.grid": True, "grid.linewidth": 0.5, "grid.alpha": 0.4,
     "legend.facecolor": "#161d2e", "legend.edgecolor": "#2d3f5e",
-    "legend.fontsize":  9, "figure.autolayout": False,
+    "legend.fontsize": 9, "figure.autolayout": False,
     "font.family": "monospace",
 })
 
-BG_DEEP  = "#060a10"
-BG       = "#0d1117"
-BG_MID   = "#0f1520"
-SIDEBAR  = "#080c14"
-CARD     = "#131b2a"
-CARD2    = "#1a2438"
-BORDER   = "#1e3a5f"
-BORDER2  = "#0e2040"
+BG_DEEP = "#060a10"; BG = "#0d1117"; BG_MID = "#0f1520"
+SIDEBAR = "#080c14"; CARD = "#131b2a"; CARD2 = "#1a2438"
+BORDER  = "#1e3a5f"; BORDER2 = "#0e2040"
 
-COL_DATASET   = "#22d3ee"
-COL_CLUSTER   = "#a78bfa"
-COL_WEIGHTS   = "#f59e0b"
-COL_ANOMALY   = "#f87171"
-COL_EVENTS    = "#34d399"
-COL_FEATURES  = "#60a5fa"
-COL_EXPORT    = "#4ade80"
-COL_PREVIEW   = "#94a3b8"
-COL_PARAM_ANOM = "#fb923c"
-COL_SIMILARITY = "#e879f9"   # NEW — parameter similarity accent
+COL_DATASET    = "#22d3ee"; COL_CLUSTER  = "#a78bfa"
+COL_ANOMALY    = "#f87171"; COL_EVENTS   = "#34d399"
+COL_FEATURES   = "#60a5fa"; COL_EXPORT   = "#4ade80"
+COL_PREVIEW    = "#94a3b8"; COL_CHATBOT  = "#e879f9"
 
-ACCENT  = "#3b82f6"
-FG      = "#f1f5f9"
-FG_MID  = "#cbd5e1"
-FG_DIM  = "#4a6080"
-SUCCESS = "#10b981"
-SUCCESS2 = "#34d399"
-WARN    = "#f59e0b"
-ERR     = "#ef4444"
-ANOMALY_C = "#ef4444"
-NORMAL_C  = "#3b82f6"
+ACCENT = "#3b82f6"; FG = "#f1f5f9"; FG_MID = "#cbd5e1"; FG_DIM = "#4a6080"
+SUCCESS = "#10b981"; SUCCESS2 = "#34d399"; WARN = "#f59e0b"
+ERR = "#ef4444"; ANOMALY_C = "#ef4444"; NORMAL_C = "#3b82f6"
 
-CLUSTER_PALETTE = [
-    "#f59e0b","#3b82f6","#10b981","#ec4899",
-    "#8b5cf6","#06b6d4","#ef4444","#84cc16","#f97316","#a78bfa",
-]
-EVENT_COLOURS = {
-    "well on":              "#10b981",
-    "well off":             "#ef4444",
-    "maintenance shutdown": "#f59e0b",
-    "pump failure":         "#f97316",
-    "water breakthrough":   "#06b6d4",
-}
+CLUSTER_PALETTE = ["#f59e0b","#3b82f6","#10b981","#ec4899",
+                   "#8b5cf6","#06b6d4","#ef4444","#84cc16","#f97316","#a78bfa"]
+EVENT_COLOURS   = {"well on":"#10b981","well off":"#ef4444",
+                   "maintenance shutdown":"#f59e0b","pump failure":"#f97316",
+                   "water breakthrough":"#06b6d4"}
+SEV_COLORS = {"NONE":"#2d3f5e","LOW":"#10b981","MODERATE":"#f59e0b",
+              "ELEVATED":"#f97316","HIGH":"#ef4444"}
 
-FONT_H1 = ("Georgia",     13, "bold")
-FONT_H2 = ("Georgia",     11, "bold")
-FONT_H3 = ("Courier New", 10, "bold")
-FONT_SM = ("Courier New",  9)
-FONT_XS = ("Courier New",  8)
-
-SEV_COLORS = {
-    "NONE":     "#2d3f5e",
-    "LOW":      "#10b981",
-    "MODERATE": "#f59e0b",
-    "ELEVATED": "#f97316",
-    "HIGH":     "#ef4444",
-}
+FONT_H1 = ("Georgia",13,"bold"); FONT_H2 = ("Georgia",11,"bold")
+FONT_H3 = ("Courier New",10,"bold"); FONT_SM = ("Courier New",9); FONT_XS = ("Courier New",8)
 
 # ── Global state ──────────────────────────────────────────────────────────────
 raw_data              = None
@@ -288,161 +196,353 @@ active_df             = None
 active_X              = None
 active_xcols          = []
 active_anomaly_result = None
-active_weight_result  = None
 active_event_result   = None
-active_rpm_result     = None
-active_param_anom     = None
-active_well_df        = None   # NEW — per-well aggregated dataframe
+active_well_df        = None
 active_figures        = {}
+active_cluster_method = "—"
+active_insights_text  = ""
 
-weight_vars       = {}
-weight_row_frames = []
-weight_sum_var    = None
-weight_sum_lbl    = None
+feat_all_vars   = {}
+feat_all_frames = []
+feat_count_var  = None
 
-# Feature selection state
-feat_num_vars   = {}   # col -> BooleanVar  (numeric checkboxes)
-feat_cat_vars   = {}   # col -> BooleanVar  (categorical checkboxes)
-feat_num_frames = []
-feat_cat_frames = []
+# Chatbot conversation history
+chatbot_history = []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WELL-BASED AGGREGATION (key for speed on huge datasets)
+# WELL ID DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 def _find_well_id_column(df):
-    """Detect the well identifier column."""
-    id_keywords = ["wellid", "well_id", "wellname", "well_name",
-                   "wellno", "well_no", "uwi", "api", "well"]
+    id_kw = ["wellid","well_id","wellname","well_name","wellno","well_no",
+             "uwi","api","well","borehole","bore","field_well","slot"]
+    param_kw = ["status","state","type","mode","zone","formation","operator",
+                "company","region","area","basin","country","field"]
+
     for c in df.columns:
-        cl = c.lower().replace(" ", "").replace("_", "").replace("-", "")
-        for kw in id_keywords:
-            kw2 = kw.replace("_", "").replace(" ", "")
-            if cl == kw2 or cl.startswith(kw2):
+        cl = c.lower().replace(" ","").replace("_","").replace("-","")
+        for kw in id_kw:
+            if cl == kw.replace("_","") or cl.startswith(kw.replace("_","")):
                 return c
-    # Fallback: first object column
+
+    n = len(df)
+    candidates = []
     for c in df.columns:
-        if df[c].dtype == object:
-            if df[c].nunique() < len(df) * 0.5:
-                return c
+        import pandas as pd
+        nuniq = df[c].nunique()
+        is_obj = not pd.api.types.is_numeric_dtype(df[c])
+        is_int = pd.api.types.is_integer_dtype(df[c])
+        cl = c.lower()
+
+        if any(kw in cl for kw in param_kw):
+            continue
+        if pd.api.types.is_float_dtype(df[c]):
+            continue
+        if nuniq < 2 or nuniq > n * 0.90:
+            continue
+
+        if is_obj or is_int:
+            score = 0
+            if any(k in cl for k in ["id","no","num","name","code","key","ref"]):
+                score += 10
+            if is_obj:
+                score += 5
+            score += nuniq / n * 5
+            candidates.append((score, c))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     return None
 
 
-def aggregate_by_well(df, num_cols, well_id_col=None):
-    """
-    Aggregate records into one row per well.
-    Returns a dataframe with one row per well,
-    columns = [mean, std, min, max, p25, p75, count] per numeric col.
-    This is what we cluster on.
-    """
-    import pandas as pd
-    if well_id_col is None or well_id_col not in df.columns:
-        # No well column — treat each row as its own well
-        return df[num_cols].copy().reset_index(drop=True), None
-
-    valid_cols = [c for c in num_cols if c in df.columns]
-    if not valid_cols:
-        return df[[well_id_col]].drop_duplicates().reset_index(drop=True), None
-
-    agg_dict = {}
-    for c in valid_cols:
-        agg_dict[f"{c}__mean"] = pd.NamedAgg(column=c, aggfunc="mean")
-        agg_dict[f"{c}__std"]  = pd.NamedAgg(column=c, aggfunc="std")
-        agg_dict[f"{c}__min"]  = pd.NamedAgg(column=c, aggfunc="min")
-        agg_dict[f"{c}__max"]  = pd.NamedAgg(column=c, aggfunc="max")
-        agg_dict[f"{c}__p25"]  = pd.NamedAgg(column=c, aggfunc=lambda x: x.quantile(0.25))
-        agg_dict[f"{c}__p75"]  = pd.NamedAgg(column=c, aggfunc=lambda x: x.quantile(0.75))
-        agg_dict[f"{c}__cnt"]  = pd.NamedAgg(column=c, aggfunc="count")
-
-    well_df = df.groupby(well_id_col).agg(**agg_dict).reset_index()
-    well_df["record_count"] = df.groupby(well_id_col).size().values
-    return well_df, well_id_col
+# ══════════════════════════════════════════════════════════════════════════════
+# SAFE MODE HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+def _safe_mode(series):
+    try:
+        s = series.dropna()
+        if len(s) == 0:
+            return ""
+        m = s.mode()
+        if len(m) == 0:
+            return s.iloc[0]
+        return m.iloc[0]
+    except Exception:
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PARAMETER SIMILARITY
+# WELL AGGREGATION
 # ══════════════════════════════════════════════════════════════════════════════
-def compute_parameter_similarity(df, num_cols):
-    """
-    Compute Pearson correlation + cosine similarity between numeric columns.
-    Returns corr_matrix, cosine_matrix (both as DataFrames).
-    """
+def aggregate_by_well(df, selected_cols, well_id_col):
     import pandas as pd
-    valid = [c for c in num_cols if c in df.columns]
-    if len(valid) < 2:
-        return None, None
 
-    sub = df[valid].dropna()
-    if len(sub) < 5:
-        return None, None
+    selected_cols = [c for c in selected_cols if c in df.columns]
+    if not selected_cols:
+        return df.iloc[:0].copy(), [], []
 
-    # Pearson correlation
-    corr = sub.corr(method="pearson")
+    num_cols = [c for c in selected_cols if pd.api.types.is_numeric_dtype(df[c])]
+    cat_cols = [c for c in selected_cols if not pd.api.types.is_numeric_dtype(df[c])]
 
-    # Cosine similarity on standardised columns
-    X = sub.values.astype(float)
-    mu = X.mean(axis=0); s = X.std(axis=0); s[s == 0] = 1
-    Xn = (X - mu) / s
-    norms = np.linalg.norm(Xn, axis=0, keepdims=True)
-    norms[norms == 0] = 1
-    Xunit = Xn / norms
-    cos_mat = (Xunit.T @ Xunit) / len(Xunit)
-    cosine = pd.DataFrame(cos_mat, index=valid, columns=valid)
+    def _agg_groups(groups, id_col=None):
+        records = []
+        for key, grp in groups:
+            row = {}
+            if id_col is not None:
+                row[id_col] = key
 
-    return corr, cosine
+            for c in num_cols:
+                vals = grp[c].dropna()
+                if len(vals) == 0:
+                    row[f"{c}__mean"] = np.nan
+                    row[f"{c}__std"]  = 0.0
+                    row[f"{c}__min"]  = np.nan
+                    row[f"{c}__max"]  = np.nan
+                else:
+                    row[f"{c}__mean"] = float(vals.mean())
+                    row[f"{c}__std"]  = float(vals.std()) if len(vals) > 1 else 0.0
+                    row[f"{c}__min"]  = float(vals.min())
+                    row[f"{c}__max"]  = float(vals.max())
+
+            for c in cat_cols:
+                row[f"{c}__mode"] = str(_safe_mode(grp[c]))
+
+            row["record_count"] = len(grp)
+            records.append(row)
+
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records).reset_index(drop=True)
+
+    if well_id_col and well_id_col in df.columns:
+        groups = df.groupby(well_id_col, sort=False)
+        well_df = _agg_groups(groups, id_col=well_id_col)
+
+        num_agg_cols = [f"{c}__{s}" for c in num_cols
+                        for s in ["mean","std","min","max"]
+                        if f"{c}__{s}" in well_df.columns]
+        cat_agg_cols = [f"{c}__mode" for c in cat_cols
+                        if f"{c}__mode" in well_df.columns]
+        return well_df, num_agg_cols, cat_agg_cols
+
+    if cat_cols:
+        try:
+            groups = df.groupby(cat_cols, sort=False, dropna=False)
+            well_df = _agg_groups(groups, id_col=None)
+
+            num_agg_cols = [f"{c}__{s}" for c in num_cols
+                            for s in ["mean","std","min","max"]
+                            if f"{c}__{s}" in well_df.columns]
+            cat_agg_cols = [f"{c}__mode" for c in cat_cols
+                            if f"{c}__mode" in well_df.columns]
+
+            if len(well_df) >= 2:
+                return well_df, num_agg_cols, cat_agg_cols
+        except Exception:
+            pass
+
+    result = df[selected_cols].copy().reset_index(drop=True)
+    rename_map = {}
+    for c in num_cols:
+        rename_map[c] = f"{c}__mean"
+    for c in cat_cols:
+        result[c] = result[c].fillna("MISSING").astype(str)
+        rename_map[c] = f"{c}__mode"
+    result = result.rename(columns=rename_map)
+    result["record_count"] = 1
+
+    num_agg_cols = [f"{c}__mean" for c in num_cols if f"{c}__mean" in result.columns]
+    cat_agg_cols = [f"{c}__mode" for c in cat_cols if f"{c}__mode" in result.columns]
+    return result, num_agg_cols, cat_agg_cols
 
 
-def plot_similarity(corr_matrix, cosine_matrix):
-    """
-    Two-panel heatmap: Pearson correlation | Cosine similarity.
-    """
-    import matplotlib.colors as mcolors
+# ══════════════════════════════════════════════════════════════════════════════
+# ROBUST MIXED-DATA CLUSTERING
+# ══════════════════════════════════════════════════════════════════════════════
+def _impute_numeric(arr):
+    arr = arr.copy().astype(float)
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        nan_mask = np.isnan(col)
+        if nan_mask.all():
+            arr[:, j] = 0.0
+        elif nan_mask.any():
+            arr[nan_mask, j] = float(np.nanmean(col))
+    return arr
 
-    if corr_matrix is None:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        fig.patch.set_facecolor("#0d1117"); _style_ax(ax)
-        ax.text(0.35, 0.5, "Need ≥ 2 numeric features",
-                transform=ax.transAxes, color=FG_DIM, fontsize=11)
-        ax.set_title("Parameter Similarity", color=COL_SIMILARITY, fontsize=13, pad=12)
-        return fig
 
-    cols = list(corr_matrix.columns)
-    n    = len(cols)
-    fig_w = max(10, n * 0.8 + 3)
-    fig_h = max(5,  n * 0.55 + 2)
-    fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h))
-    fig.patch.set_facecolor("#0d1117")
+def run_clustering_robust(well_df, num_agg_cols, cat_agg_cols, n_clusters, weight_map):
+    import pandas as pd
+    from sklearn.cluster import AgglomerativeClustering
 
-    # Diverging colormap: red=negative, white=zero, blue=positive
-    cmap_div  = matplotlib.cm.coolwarm
-    cmap_seq  = matplotlib.cm.YlOrRd
+    n = len(well_df)
+    n_clusters = max(2, min(n_clusters, n - 1 if n > 2 else 1))
 
-    def _draw_heatmap(ax, matrix, title, cmap, vmin, vmax, fmt=".2f"):
-        _style_ax(ax)
-        data = matrix.values
-        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-        ax.set_xticks(range(n)); ax.set_yticks(range(n))
-        fs = max(5.5, 9 - n * 0.4)
-        ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=fs, color=FG_MID)
-        ax.set_yticklabels(cols, fontsize=fs, color=FG_MID)
-        # Annotate cells
-        for i in range(n):
-            for j in range(n):
-                val = data[i, j]
-                txt_col = "#000" if 0.3 < (val - vmin) / max(vmax - vmin, 1e-6) < 0.7 else "#fff"
-                if n <= 15:
-                    ax.text(j, i, format(val, fmt), ha="center", va="center",
-                            fontsize=max(5, 8 - n * 0.3), color=txt_col)
-        ax.set_title(title, color=COL_SIMILARITY, fontsize=10, pad=8, fontweight="bold")
-        plt.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    has_num = bool(num_agg_cols)
+    has_cat = bool(cat_agg_cols)
 
-    _draw_heatmap(axes[0], corr_matrix,   "Pearson Correlation",  cmap_div,  -1, 1, ".2f")
-    _draw_heatmap(axes[1], cosine_matrix, "Cosine Similarity",    cmap_seq,   0, 1, ".2f")
+    X_num = np.zeros((n, 0), dtype=float)
+    w_num = np.ones(0, dtype=float)
 
-    fig.suptitle("Parameter Similarity Matrix",
-                 color=COL_SIMILARITY, fontsize=13, fontweight="bold", y=1.01)
-    fig.tight_layout(pad=1.5)
-    return fig
+    if has_num:
+        raw = well_df[num_agg_cols].values.astype(float)
+        X_num = _impute_numeric(raw)
+        lo = X_num.min(axis=0); hi = X_num.max(axis=0)
+        rng = np.where(hi - lo > 0, hi - lo, 1.0)
+        X_num = (X_num - lo) / rng
+
+        w_num_list = []
+        for c in num_agg_cols:
+            orig = (c.replace("__mean","").replace("__std","")
+                     .replace("__min","").replace("__max",""))
+            w_num_list.append(float(weight_map.get(orig, 1.0)))
+        w_num = np.array(w_num_list, dtype=float)
+        ws = w_num.sum()
+        if ws > 0: w_num = w_num / ws
+
+    cat_matrix = None
+    w_cat = np.ones(0, dtype=float)
+
+    if has_cat:
+        cat_matrix = well_df[cat_agg_cols].fillna("MISSING").astype(str).values
+        w_cat = np.ones(len(cat_agg_cols), dtype=float)
+        if len(cat_agg_cols) > 0:
+            w_cat = w_cat / w_cat.sum()
+
+    if has_num and has_cat:
+        try:
+            from kmodes.kprototypes import KPrototypes
+            X_mixed = np.hstack([X_num, cat_matrix])
+            cat_idx = list(range(X_num.shape[1], X_mixed.shape[1]))
+            kp = KPrototypes(n_clusters=n_clusters, init="Cao", n_init=3, random_state=42)
+            labels = kp.fit_predict(X_mixed, categorical=cat_idx)
+            return labels.astype(int), float(kp.cost_), f"KPrototypes (n={n_clusters})"
+        except Exception:
+            pass
+
+    if has_cat and not has_num:
+        try:
+            from kmodes.kmodes import KModes
+            km = KModes(n_clusters=n_clusters, init="Cao", n_init=3, random_state=42)
+            labels = km.fit_predict(cat_matrix)
+            return labels.astype(int), float(km.cost_), f"KModes/categorical (n={n_clusters})"
+        except Exception:
+            pass
+
+    if n <= 8000:
+        try:
+            dist_matrix = _gower_fast(X_num, cat_matrix, w_num, w_cat)
+            dist_matrix = np.nan_to_num(dist_matrix, nan=1.0, posinf=1.0, neginf=0.0)
+            np.fill_diagonal(dist_matrix, 0.0)
+            ac = AgglomerativeClustering(n_clusters=n_clusters,
+                                          metric="precomputed", linkage="average")
+            labels = ac.fit_predict(dist_matrix).astype(int)
+            inertia = _pseudo_inertia(dist_matrix, labels)
+            return labels, inertia, f"Agglomerative/Gower (n={n_clusters})"
+        except Exception:
+            pass
+
+    try:
+        X_enc = _build_encoded_matrix_v2(X_num, cat_matrix, w_num, w_cat)
+        if X_enc.shape[1] > 0 and X_enc.shape[0] >= 2:
+            ac2 = AgglomerativeClustering(n_clusters=n_clusters,
+                                           metric="euclidean", linkage="ward")
+            labels = ac2.fit_predict(X_enc).astype(int)
+            inertia = _pseudo_inertia_euclidean(X_enc, labels)
+            return labels, inertia, f"Agglomerative/Ward+encoded (n={n_clusters})"
+    except Exception:
+        pass
+
+    try:
+        from sklearn.cluster import KMeans
+        X_enc = _build_encoded_matrix_v2(X_num, cat_matrix, w_num, w_cat)
+        if X_enc.shape[1] == 0:
+            X_enc = np.zeros((n, 1))
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+        labels = km.fit_predict(X_enc).astype(int)
+        return labels, float(km.inertia_), f"KMeans+encoded (n={n_clusters})"
+    except Exception:
+        pass
+
+    labels = np.arange(n) % n_clusters
+    return labels.astype(int), 0.0, "Round-robin fallback"
+
+
+def _gower_fast(X_num, cat_matrix, w_num, w_cat):
+    n = X_num.shape[0]
+    dist = np.zeros((n, n), dtype=np.float32)
+
+    p_num = X_num.shape[1]
+    p_cat = cat_matrix.shape[1] if cat_matrix is not None else 0
+    total_cols = p_num + p_cat
+    if total_cols == 0:
+        return dist
+
+    if p_num > 0:
+        for k in range(p_num):
+            col = X_num[:, k].reshape(-1, 1)
+            d = np.abs(col - col.T)
+            dist += (w_num[k] if k < len(w_num) else 1.0 / p_num) * d
+
+    if p_cat > 0 and cat_matrix is not None:
+        for k in range(p_cat):
+            col = cat_matrix[:, k]
+            mismatch = (col.reshape(-1, 1) != col.reshape(1, -1)).astype(np.float32)
+            dist += (w_cat[k] if k < len(w_cat) else 1.0 / p_cat) * mismatch
+
+    total_w = (w_num.sum() if p_num > 0 else 0) + (w_cat.sum() if p_cat > 0 else 0)
+    if total_w > 0:
+        dist /= total_w
+
+    return dist.astype(np.float64)
+
+
+def _build_encoded_matrix_v2(X_num, cat_matrix, w_num, w_cat):
+    import pandas as pd
+    cols = []
+
+    if X_num is not None and X_num.shape[1] > 0:
+        for j in range(X_num.shape[1]):
+            w = float(w_num[j]) if j < len(w_num) else 1.0
+            cols.append((X_num[:, j] * w).reshape(-1, 1))
+
+    if cat_matrix is not None and cat_matrix.shape[1] > 0:
+        for k in range(cat_matrix.shape[1]):
+            vals = cat_matrix[:, k]
+            codes = pd.Categorical(vals).codes.astype(float)
+            lo, hi = codes.min(), codes.max()
+            rng = hi - lo if hi != lo else 1.0
+            scaled = (codes - lo) / rng
+            w = float(w_cat[k]) if k < len(w_cat) else 1.0
+            cols.append((scaled * w).reshape(-1, 1))
+
+    if not cols:
+        return np.zeros((X_num.shape[0] if X_num is not None else 1, 1))
+    return np.hstack(cols)
+
+
+def _pseudo_inertia(dist_matrix, labels):
+    total = 0.0; count = 0
+    for cl in np.unique(labels):
+        idx = np.where(labels == cl)[0]
+        if len(idx) < 2: continue
+        sub = dist_matrix[np.ix_(idx, idx)]
+        total += float(sub.sum())
+        count += len(idx) * (len(idx) - 1)
+    return total / max(count, 1)
+
+
+def _pseudo_inertia_euclidean(X, labels):
+    total = 0.0
+    for cl in np.unique(labels):
+        mask = labels == cl
+        sub = X[mask]
+        if len(sub) == 0: continue
+        centroid = sub.mean(axis=0)
+        total += float(((sub - centroid) ** 2).sum())
+    return total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,25 +554,18 @@ def cluster_hex(n):
 def _lighten(hex_col, amount=30):
     try:
         h = hex_col.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return "#{:02x}{:02x}{:02x}".format(
-            min(r+amount, 255), min(g+amount, 255), min(b+amount, 255))
-    except Exception:
-        return hex_col
+        r,g,b = int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        return "#{:02x}{:02x}{:02x}".format(min(r+amount,255),min(g+amount,255),min(b+amount,255))
+    except: return hex_col
 
-def ts():
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+def ts(): return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def set_status(msg, color=FG_DIM):
-    status_var.set(msg)
-    status_lbl.config(fg=color)
+    status_var.set(msg); status_lbl.config(fg=color)
 
 def _save_df(df, path):
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".xlsx", ".xls"):
-        df.to_excel(path, index=False)
-    else:
-        df.to_csv(path, index=False)
+    df.to_excel(path, index=False) if ext in (".xlsx",".xls") else df.to_csv(path, index=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -483,47 +576,41 @@ class Tooltip:
         self.widget = widget; self.text = text; self.tip = None
         widget.bind("<Enter>", self._show); widget.bind("<Leave>", self._hide)
     def _show(self, _=None):
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        x = self.widget.winfo_rootx()+20; y = self.widget.winfo_rooty()+self.widget.winfo_height()+4
         self.tip = tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True); tw.wm_geometry(f"+{x}+{y}")
-        tw.configure(bg=BORDER)
-        tk.Label(tw, text=self.text, bg=CARD2, fg=FG_MID,
-                 font=FONT_XS, padx=8, pady=4).pack()
+        tw.wm_overrideredirect(True); tw.wm_geometry(f"+{x}+{y}"); tw.configure(bg=BORDER)
+        tk.Label(tw, text=self.text, bg=CARD2, fg=FG_MID, font=FONT_XS, padx=8, pady=4).pack()
     def _hide(self, _=None):
         if self.tip: self.tip.destroy(); self.tip = None
 
-
 def make_scrollable(parent, bg=BG):
-    outer  = tk.Frame(parent, bg=bg)
+    outer = tk.Frame(parent, bg=bg)
     canvas = Canvas(outer, bg=bg, highlightthickness=0, bd=0)
-    sb     = Scrollbar(outer, orient="vertical", command=canvas.yview,
-                       bg=BORDER, troughcolor=bg, activebackground=ACCENT)
+    sb = Scrollbar(outer, orient="vertical", command=canvas.yview,
+                   bg=BORDER, troughcolor=bg, activebackground=ACCENT)
     canvas.configure(yscrollcommand=sb.set)
     sb.pack(side="right", fill="y"); canvas.pack(side="left", fill="both", expand=True)
     inner = tk.Frame(canvas, bg=bg)
-    wid   = canvas.create_window((0, 0), window=inner, anchor="nw")
+    wid = canvas.create_window((0,0), window=inner, anchor="nw")
     def _resize(e):
         canvas.configure(scrollregion=canvas.bbox("all"))
         canvas.itemconfig(wid, width=e.width)
     inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>", _resize)
     def _wheel(e):
-        if   e.num == 4: canvas.yview_scroll(-1, "units")
-        elif e.num == 5: canvas.yview_scroll( 1, "units")
-        else: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        if e.num==4: canvas.yview_scroll(-1,"units")
+        elif e.num==5: canvas.yview_scroll(1,"units")
+        else: canvas.yview_scroll(int(-1*(e.delta/120)),"units")
     canvas.bind_all("<MouseWheel>", _wheel)
-    canvas.bind_all("<Button-4>",   _wheel)
-    canvas.bind_all("<Button-5>",   _wheel)
+    canvas.bind_all("<Button-4>", _wheel); canvas.bind_all("<Button-5>", _wheel)
     return outer, inner
-
 
 def make_section_card(parent, title, accent_color, **pack_kw):
     wrapper = tk.Frame(parent, bg=SIDEBAR, pady=0)
-    wrapper.pack(**{"fill": "x", "pady": (0, 2), **pack_kw})
+    wrapper.pack(**{"fill":"x","pady":(0,2),**pack_kw})
     hdr = tk.Frame(wrapper, bg=accent_color, height=26)
     hdr.pack(fill="x"); hdr.pack_propagate(False)
-    dark_text = accent_color in (COL_WEIGHTS, COL_EXPORT, COL_EVENTS)
+    dark_text = accent_color in ("#f59e0b", COL_EXPORT, COL_EVENTS)
     tk.Label(hdr, text=f"  {title}", bg=accent_color,
              fg="#000000" if dark_text else "#ffffff",
              font=FONT_H3, anchor="w").pack(side="left", fill="y", padx=4)
@@ -532,142 +619,98 @@ def make_section_card(parent, title, accent_color, **pack_kw):
     body.pack(fill="x")
     return body
 
-
 def make_btn(parent, text, cmd, color=ACCENT, fg_col="#fff", tip=None):
     b = tk.Button(parent, text=text, command=cmd, bg=color, fg=fg_col,
                   activebackground=_lighten(color), activeforeground=fg_col,
-                  font=FONT_H3, relief="flat", bd=0, cursor="hand2",
-                  padx=10, pady=8, anchor="w")
+                  font=FONT_H3, relief="flat", bd=0, cursor="hand2", padx=10, pady=8, anchor="w")
     b.pack(fill="x", pady=2)
     if tip: Tooltip(b, tip)
     b.bind("<Enter>", lambda e: b.config(bg=_lighten(color)))
     b.bind("<Leave>", lambda e: b.config(bg=color))
     return b
 
-
 def _icon_btn(parent, text, cmd, bg, fg, tip=None):
     b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                  activebackground=_lighten(bg, 20), activeforeground=fg,
+                  activebackground=_lighten(bg,20), activeforeground=fg,
                   font=FONT_XS, relief="flat", bd=0, cursor="hand2", padx=8, pady=5)
     b.pack(side="right", padx=3)
     if tip: Tooltip(b, tip)
-    b.bind("<Enter>", lambda e: b.config(bg=_lighten(bg, 20)))
+    b.bind("<Enter>", lambda e: b.config(bg=_lighten(bg,20)))
     b.bind("<Leave>", lambda e: b.config(bg=bg))
     return b
 
-
 def _divider(parent, color=BORDER):
-    tk.Frame(parent, bg=color, height=1).pack(fill="x", padx=6, pady=(4, 3))
-
+    tk.Frame(parent, bg=color, height=1).pack(fill="x", padx=6, pady=(4,3))
 
 def _mini_bar(parent, label, frac, col, label_width=8):
     row = tk.Frame(parent, bg=CARD); row.pack(fill="x", padx=8, pady=2)
-    tk.Label(row, text=label[:label_width], bg=CARD, fg=FG_DIM,
-             font=FONT_XS, width=label_width).pack(side="left")
-    outer = tk.Frame(row, bg=BORDER2, height=7)
-    outer.pack(side="left", fill="x", expand=True, padx=(3, 0))
-    tk.Frame(outer, bg=col, height=7).place(relwidth=max(frac, 0.03), relheight=1.0)
+    tk.Label(row, text=label[:label_width], bg=CARD, fg=FG_DIM, font=FONT_XS, width=label_width).pack(side="left")
+    outer = tk.Frame(row, bg=BORDER2, height=7); outer.pack(side="left", fill="x", expand=True, padx=(3,0))
+    tk.Frame(outer, bg=col, height=7).place(relwidth=max(frac,0.03), relheight=1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE SELECTION PANEL (NEW)
+# UNIFIED FEATURE SELECTION PANEL
 # ══════════════════════════════════════════════════════════════════════════════
-feat_search_var_num = None
-feat_search_var_cat = None
-feat_num_count_var  = None
-feat_cat_count_var  = None
+def _update_feat_count(*_):
+    n_sel = sum(1 for v in feat_all_vars.values() if v.get())
+    if feat_count_var:
+        feat_count_var.set(f"{n_sel} / {len(feat_all_vars)} selected")
 
-
-def _update_feat_count():
-    """Update selected feature count labels."""
-    global feat_num_count_var, feat_cat_count_var
-    n_sel = sum(1 for v in feat_num_vars.values() if v.get())
-    c_sel = sum(1 for v in feat_cat_vars.values() if v.get())
-    if feat_num_count_var: feat_num_count_var.set(f"{n_sel}/{len(feat_num_vars)} selected")
-    if feat_cat_count_var: feat_cat_count_var.set(f"{c_sel}/{len(feat_cat_vars)} selected")
-
-
-def _filter_feat_checkboxes(search_val, frames_list, vars_dict):
-    """Show/hide checkboxes based on search text."""
-    sv = search_val.lower().strip()
-    for col, frm in frames_list:
-        show = (sv == "" or sv in col.lower())
-        if show:
-            frm.pack(fill="x", padx=2, pady=1)
-        else:
-            frm.pack_forget()
-
+def _filter_feat_list(*_):
+    query = feat_search_var.get().lower().strip()
+    for col, frm in feat_all_frames:
+        show = (query == "" or query in col.lower())
+        if show: frm.pack(fill="x", padx=2, pady=1)
+        else:    frm.pack_forget()
 
 def rebuild_feature_panel(df):
-    """
-    Rebuild the feature selection checkboxes for numeric and categorical cols.
-    Called after dataset load.
-    """
-    global feat_num_vars, feat_cat_vars, feat_num_frames, feat_cat_frames
-
-    # Clear existing
-    for _, f in feat_num_frames:
+    global feat_all_vars, feat_all_frames
+    for _, f in feat_all_frames:
         try: f.destroy()
         except: pass
-    for _, f in feat_cat_frames:
-        try: f.destroy()
-        except: pass
-    feat_num_vars.clear()
-    feat_cat_vars.clear()
-    feat_num_frames.clear()
-    feat_cat_frames.clear()
+    feat_all_vars.clear(); feat_all_frames.clear()
 
-    num_cols = list(df.select_dtypes(include="number").columns)
-    cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns
-                if df[c].nunique() < 500]   # cap cardinality
+    import pandas as pd
 
-    # ── Numeric checkboxes ──
-    for col in num_cols:
-        var = tk.BooleanVar(value=True)
-        var.trace_add("write", lambda *a: _update_feat_count())
-        feat_num_vars[col] = var
-        frm = tk.Frame(feat_num_body, bg=CARD2,
+    for col in df.columns:
+        is_num = pd.api.types.is_numeric_dtype(df[col])
+        nuniq  = df[col].nunique()
+        dtype  = str(df[col].dtype)[:10]
+
+        if not is_num and nuniq > min(500, len(df) * 0.8):
+            continue
+
+        var = tk.BooleanVar(value=is_num)
+        var.trace_add("write", _update_feat_count)
+        feat_all_vars[col] = var
+
+        frm = tk.Frame(feat_all_body, bg=CARD2,
                        highlightbackground=BORDER2, highlightthickness=1)
-        cb = tk.Checkbutton(frm, text=col[:30], variable=var,
-                            bg=CARD2, fg=COL_FEATURES,
-                            selectcolor=CARD, activebackground=CARD2,
-                            activeforeground=COL_FEATURES,
-                            font=FONT_XS, anchor="w", wraplength=200)
-        cb.pack(side="left", padx=4, pady=2)
-        # Dtype badge
-        dtype = str(df[col].dtype)[:8]
-        tk.Label(frm, text=dtype, bg=CARD2, fg=FG_DIM,
-                 font=("Courier New", 7)).pack(side="right", padx=4)
-        feat_num_frames.append((col, frm))
-        frm.pack(fill="x", padx=2, pady=1)
 
-    # ── Categorical checkboxes ──
-    for col in cat_cols:
-        var = tk.BooleanVar(value=False)
-        var.trace_add("write", lambda *a: _update_feat_count())
-        feat_cat_vars[col] = var
-        frm = tk.Frame(feat_cat_body, bg=CARD2,
-                       highlightbackground=BORDER2, highlightthickness=1)
-        nuniq = df[col].nunique()
-        cb = tk.Checkbutton(frm, text=col[:28], variable=var,
-                            bg=CARD2, fg=COL_EVENTS,
+        type_col = COL_FEATURES if is_num else COL_EVENTS
+        tk.Canvas(frm, bg=type_col, width=6, height=6,
+                  highlightthickness=0).pack(side="left", padx=(4,2), pady=6)
+
+        cb = tk.Checkbutton(frm, text=f"{col[:30]}",
+                            variable=var,
+                            bg=CARD2, fg=type_col,
                             selectcolor=CARD, activebackground=CARD2,
-                            activeforeground=COL_EVENTS,
-                            font=FONT_XS, anchor="w", wraplength=200)
-        cb.pack(side="left", padx=4, pady=2)
-        tk.Label(frm, text=f"{nuniq} vals", bg=CARD2, fg=FG_DIM,
-                 font=("Courier New", 7)).pack(side="right", padx=4)
-        feat_cat_frames.append((col, frm))
+                            activeforeground=type_col,
+                            font=FONT_XS, anchor="w")
+        cb.pack(side="left", padx=2, pady=2, fill="x", expand=True)
+
+        badge = f"{dtype}  |  {nuniq} uniq"
+        tk.Label(frm, text=badge, bg=CARD2, fg=FG_DIM,
+                 font=("Courier New",7)).pack(side="right", padx=6)
+
+        feat_all_frames.append((col, frm))
         frm.pack(fill="x", padx=2, pady=1)
 
     _update_feat_count()
 
-
 def get_selected_features():
-    """Return (selected_num_cols, selected_cat_cols)."""
-    num = [c for c, v in feat_num_vars.items() if v.get()]
-    cat = [c for c, v in feat_cat_vars.items() if v.get()]
-    return num, cat
+    return [c for c, v in feat_all_vars.items() if v.get()]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -681,95 +724,34 @@ def progress_stop():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DYNAMIC WEIGHT PANEL
-# ══════════════════════════════════════════════════════════════════════════════
-def _update_weight_sum(*_):
-    total = 0.0
-    for v in weight_vars.values():
-        try: total += float(v.get())
-        except: pass
-    ok = abs(total - 100.0) < 0.5
-    weight_sum_var.set(f"Total: {total:.1f}%  {'✔  OK' if ok else '⚠  should be 100'}")
-    weight_sum_lbl.config(fg=SUCCESS2 if ok else WARN)
-
-
-def rebuild_weight_panel(num_cols):
-    global weight_vars, weight_row_frames
-    for f in weight_row_frames:
-        try: f.destroy()
-        except: pass
-    weight_row_frames.clear(); weight_vars.clear()
-    if not num_cols:
-        lbl = tk.Label(weight_body, text="No numeric columns.", bg=CARD, fg=WARN, font=FONT_XS)
-        lbl.pack(anchor="w"); weight_row_frames.append(lbl); _update_weight_sum(); return
-    default_pct = round(100.0 / len(num_cols), 1)
-    for i, col in enumerate(num_cols):
-        col_color = CLUSTER_PALETTE[i % len(CLUSTER_PALETTE)]
-        row = tk.Frame(weight_body, bg=CARD2, highlightbackground=BORDER, highlightthickness=1)
-        row.pack(fill="x", pady=2); weight_row_frames.append(row)
-        tk.Canvas(row, bg=col_color, width=10, height=10,
-                  highlightthickness=0).pack(side="left", padx=(6, 4), pady=6)
-        tk.Label(row, text=col[:22], bg=CARD2, fg=col_color,
-                 font=FONT_XS, width=22, anchor="w").pack(side="left")
-        wvar = tk.StringVar(value=str(default_pct))
-        wvar.trace_add("write", _update_weight_sum)
-        weight_vars[col] = wvar
-        sp = tk_ttk.Spinbox(row, from_=0.0, to=100.0, increment=1.0,
-                            textvariable=wvar, width=7, font=FONT_XS)
-        sp.pack(side="left", padx=4, pady=4)
-        tk.Label(row, text="%", bg=CARD2, fg=FG_DIM, font=FONT_XS).pack(side="left")
-    _update_weight_sum()
-
-
-def get_manual_weights():
-    raw = {}
-    for col, v in weight_vars.items():
-        try: w = float(v.get())
-        except: w = 0.0
-        if w > 0: raw[col] = w
-    total = sum(raw.values())
-    if total <= 0: return {}, 0.0
-    return {c: round(v / total * 100, 2) for c, v in raw.items()}, total
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 def upload_dataset():
     global raw_data
     f = filedialog.askopenfilename(
         title="Open Data File",
-        filetypes=[
-            ("All supported files",
-             "*.csv *.tsv *.txt *.xlsx *.xls *.xlsb *.xlsm *.ods "
-             "*.json *.parquet *.feather *.h5 *.hdf5 *.pkl *.pickle *.mdb *.accdb"),
-            ("Microsoft Access 2007+", "*.mdb *.accdb"),
-            ("CSV / TSV",              "*.csv *.tsv *.txt"),
-            ("Excel",                  "*.xlsx *.xls *.xlsb *.xlsm"),
-            ("All files",              "*.*"),
-        ]
-    )
+        filetypes=[("All supported","*.csv *.tsv *.txt *.xlsx *.xls *.xlsb *.xlsm *.ods "
+                    "*.json *.parquet *.feather *.h5 *.hdf5 *.pkl *.pickle *.mdb *.accdb"),
+                   ("CSV / TSV","*.csv *.tsv *.txt"),("Excel","*.xlsx *.xls *.xlsb *.xlsm"),
+                   ("MS Access","*.mdb *.accdb"),("All files","*.*")])
     if not f: return
-    size_mb = os.path.getsize(f) / (1024 * 1024)
-    set_status(f"⟳  Loading {os.path.basename(f)}  ({size_mb:.1f} MB) …", WARN)
+    size_mb = os.path.getsize(f) / (1024*1024)
+    set_status(f"Loading {os.path.basename(f)}  ({size_mb:.1f} MB)…", WARN)
     progress_start()
 
     def _load():
         global raw_data
         try:
-            def _cb(pct, msg):
-                app.after(0, lambda: set_status(msg, WARN))
-            df, source_label = load_any_file(f, progress_cb=_cb)
-            if len(df) == 0:
-                raise RuntimeError("File loaded but contains no rows of data.")
+            df, label = load_any_file(f, progress_cb=lambda p,m: app.after(0, lambda: set_status(m, WARN)))
+            if len(df) == 0: raise RuntimeError("File has no rows.")
             raw_data = df
+            import pandas as pd
             num_cols = list(df.select_dtypes(include="number").columns)
-            app.after(0, lambda: _post_load(df, f, num_cols, source_label))
+            app.after(0, lambda: _post_load(df, f, num_cols, label, size_mb))
         except Exception as e:
-            err = str(e)
-            app.after(0, lambda: _load_error(err))
+            app.after(0, lambda err=str(e): (_load_error(err)))
 
-    def _post_load(df, filepath, num_cols, source_label):
+    def _post_load(df, filepath, num_cols, source_label, size_mb):
         well_col = _find_well_id_column(df)
         n_rows   = len(df)
         n_unique = df[well_col].nunique() if well_col else n_rows
@@ -778,123 +760,53 @@ def upload_dataset():
         cols_var.set(str(len(df.columns)))
         num_cols_var.set(f"{len(num_cols)} numeric")
 
-        # Rebuild both panels
-        rebuild_weight_panel(num_cols)
         rebuild_feature_panel(df)
 
         ec = _find_event_column(df)
-        if ec:
-            event_col_var.set(f"✔  Event column: '{ec}'")
-            event_col_lbl.config(fg=SUCCESS2)
-        else:
-            event_col_var.set("⚠  No event/status column found")
-            event_col_lbl.config(fg=WARN)
+        event_col_var.set(f"✔  Event: '{ec}'" if ec else "⚠  No event column")
+        event_col_lbl.config(fg=SUCCESS2 if ec else WARN)
 
-        if well_col:
-            well_id_var.set(f"✔  Well ID col: '{well_col}'  ({n_unique:,} wells)")
-            well_id_lbl.config(fg=SUCCESS2)
-        else:
-            well_id_var.set("⚠  No well ID column detected")
-            well_id_lbl.config(fg=WARN)
+        well_id_var.set(f"✔  Well ID: '{well_col}'  ({n_unique:,} wells)" if well_col
+                        else "⚠  No well ID column detected")
+        well_id_lbl.config(fg=SUCCESS2 if well_col else WARN)
 
         preview_table(df)
         progress_stop()
-        set_status(
-            f"✔  {source_label}  —  {n_rows:,} rows × {len(df.columns)} cols  "
-            f"({size_mb:.1f} MB)", SUCCESS)
+        set_status(f"✔  {source_label}  —  {n_rows:,} rows × {len(df.columns)} cols  ({size_mb:.1f} MB)", SUCCESS)
+        for k in stat_widgets: stat_widgets[k].set("—")
         stat_widgets["Unique Wells"].set(f"{n_unique:,}")
         stat_widgets["Total Records"].set(f"{n_rows:,}")
         export_btn.config(state="normal")
 
     def _load_error(msg):
-        progress_stop()
-        set_status("✖  Load failed — see error dialog", ERR)
-        messagebox.showerror("File Load Error", msg)
+        progress_stop(); set_status("Load failed", ERR); messagebox.showerror("Load Error", msg)
 
     threading.Thread(target=_load, daemon=True).start()
 
-
 def _find_event_column(df):
-    keywords = ["status", "state", "event", "mode", "condition", "operation", "type"]
     for c in df.columns:
-        cl = c.lower().replace(" ", "_").replace("-", "_")
-        if any(k in cl for k in keywords):
+        if any(k in c.lower().replace(" ","_") for k in ["status","state","event","mode","condition","operation"]):
             return c
     return None
-
-
-def _find_rpm_column(df):
-    for c in df.columns:
-        if "rpm" in c.lower():
-            return c
-    return None
-
-
-def add_rpm_status_column(df):
-    rpm_col = _find_rpm_column(df)
-    if rpm_col is None:
-        return df, None, {"found": False, "col": None,
-                          "running": 0, "stopped": 0, "reverse": 0, "no_data": 0}
-    rpm = df[rpm_col].copy()
-    def _classify_rpm(v):
-        try:
-            v = float(v)
-            if   v > 0: return "Running"
-            elif v < 0: return "Reverse"
-            else:       return "Stopped"
-        except: return "No Data"
-    df = df.copy()
-    df["RPM_Status"] = rpm.apply(_classify_rpm)
-    counts = df["RPM_Status"].value_counts().to_dict()
-    return df, rpm_col, {
-        "found": True, "col": rpm_col,
-        "running":  counts.get("Running",  0),
-        "stopped":  counts.get("Stopped",  0),
-        "reverse":  counts.get("Reverse",  0),
-        "no_data":  counts.get("No Data",  0),
-    }
-
 
 def preview_table(df):
     for w in table_frame.winfo_children(): w.destroy()
     style = tk_ttk.Style()
     style.configure("P.Treeview", background=CARD, foreground=FG,
                     fieldbackground=CARD, rowheight=21, font=FONT_SM)
-    style.configure("P.Treeview.Heading", background="#0e2040",
-                    foreground=COL_PREVIEW, font=FONT_H3)
+    style.configure("P.Treeview.Heading", background="#0e2040", foreground=COL_PREVIEW, font=FONT_H3)
     style.map("P.Treeview", background=[("selected", ACCENT)])
     tv  = tk_ttk.Treeview(table_frame, style="P.Treeview")
     vsb = tk_ttk.Scrollbar(table_frame, orient="vertical",   command=tv.yview)
     hsb = tk_ttk.Scrollbar(table_frame, orient="horizontal", command=tv.xview)
     tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-    tv["columns"] = list(df.columns)
-    tv["show"]    = "headings"
+    tv["columns"] = list(df.columns); tv["show"] = "headings"
     for col in df.columns:
         tv.heading(col, text=col); tv.column(col, width=90, minwidth=60)
     for row in df.head(20).values:
-        tv.insert("", "end", values=list(row))
+        tv.insert("","end", values=list(row))
     hsb.pack(side="bottom", fill="x"); vsb.pack(side="right", fill="y")
     tv.pack(fill="both", expand=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WEIGHTED CLUSTERING (now well-based)
-# ══════════════════════════════════════════════════════════════════════════════
-def build_weighted_X(df, x_cols, weight_map):
-    cols  = [c for c in x_cols if c in df.columns]
-    Xraw  = df[cols].values.astype(float)
-    mu, s = Xraw.mean(axis=0), Xraw.std(axis=0)
-    s[s == 0] = 1
-    X_scaled = (Xraw - mu) / s
-    w_vec    = np.array([np.sqrt(weight_map.get(c, 1.0) / 100.0) for c in cols])
-    return X_scaled * w_vec, cols
-
-
-def run_clustering(X_w, n_clusters):
-    from sklearn.cluster import KMeans
-    n  = min(n_clusters, X_w.shape[0])
-    km = KMeans(n_clusters=n, random_state=42, n_init="auto")
-    return km.fit_predict(X_w), km.inertia_
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -905,122 +817,179 @@ def detect_anomalies(X_w, contamination=0.05, method="iforest"):
     from sklearn.neighbors import LocalOutlierFactor
     n = X_w.shape[0]
     if n < 5:
-        labels = np.ones(n, dtype=int)
-        return labels, 0.0, [], "N/A (too few samples)", np.zeros(n)
-    safe_cont = float(np.clip(contamination, 0.001, 0.499))
-    safe_cont = min(max(safe_cont, 1.0 / n), 0.499)
+        return np.ones(n,dtype=int), 0.0, [], "N/A (too few samples)", np.zeros(n)
+    safe_cont = min(max(float(np.clip(contamination,0.001,0.499)), 1.0/n), 0.499)
     if method == "lof":
-        k   = max(5, min(20, n // 10))
+        k = max(5, min(20, n//10))
         det = LocalOutlierFactor(n_neighbors=k, contamination=safe_cont)
-        labels = det.fit_predict(X_w)
-        scores = det.negative_outlier_factor_
-        name   = f"Local Outlier Factor (LOF, k={k})"
+        labels = det.fit_predict(X_w); scores = det.negative_outlier_factor_
+        name = f"Local Outlier Factor (k={k})"
     else:
         n_est = 100 if n <= 500 else 200
-        det   = IsolationForest(n_estimators=n_est, contamination=safe_cont,
-                                random_state=42, n_jobs=-1)
-        labels = det.fit_predict(X_w)
-        scores = det.decision_function(X_w)
-        name   = f"Isolation Forest (n_est={n_est})"
-    idx = list(np.where(labels == -1)[0])
-    pct = len(idx) / n * 100
-    return labels, pct, idx, name, scores
+        det = IsolationForest(n_estimators=n_est, contamination=safe_cont, random_state=42, n_jobs=-1)
+        labels = det.fit_predict(X_w); scores = det.decision_function(X_w)
+        name = f"Isolation Forest (n_est={n_est})"
+    idx = list(np.where(labels==-1)[0])
+    return labels, len(idx)/n*100, idx, name, scores
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EVENT ANALYSIS
-# ══════════════════════════════════════════════════════════════════════════════
 def analyse_events(df, anomaly_labels):
     ec = _find_event_column(df)
     if ec is None:
-        return {"has_events": False, "event_col": None,
-                "event_counts": {}, "event_labels": np.full(len(df), "Unknown"),
-                "n_active": 0, "n_inactive": 0,
-                "n_abnormal": int((anomaly_labels == -1).sum()),
-                "operational_anomalies": [],
-                "message": "No event/status column found in dataset."}
+        return {"has_events":False,"event_col":None,"event_counts":{},
+                "event_labels":np.full(len(df),"Unknown"),
+                "n_active":0,"n_inactive":0,
+                "n_abnormal":int((anomaly_labels==-1).sum()),
+                "operational_anomalies":[],"message":"No event/status column found."}
     raw_vals = df[ec].astype(str).str.strip()
-    event_labels = raw_vals.values
     from collections import Counter
-    event_counts = dict(Counter(event_labels))
-    active_kw   = ["on", "active", "running", "producing", "open"]
-    inactive_kw = ["off", "inactive", "shut", "stop", "closed", "idle", "down"]
-    def _classify(val):
+    event_counts = dict(Counter(raw_vals.values))
+    active_kw   = ["on","active","running","producing","open"]
+    inactive_kw = ["off","inactive","shut","stop","closed","idle","down"]
+    def _clf(val):
         vl = val.lower()
         if any(k in vl for k in active_kw):   return "active"
         if any(k in vl for k in inactive_kw): return "inactive"
         return "other"
-    statuses   = raw_vals.apply(_classify)
-    n_active   = int((statuses == "active").sum())
-    n_inactive = int((statuses == "inactive").sum())
-    n_abnormal = int((anomaly_labels == -1).sum())
-    op_anomalies = []
-    id_col = next((c for c in df.columns if "id" in c.lower()), None)
-    if id_col:
-        for wid, grp in df.groupby(id_col):
-            states = raw_vals[grp.index].apply(_classify).unique()
-            if "active" in states and "inactive" in states:
-                op_anomalies.append(str(wid))
-    return {"has_events": True, "event_col": ec,
-            "event_counts": event_counts, "event_labels": event_labels,
-            "n_active": n_active, "n_inactive": n_inactive,
-            "n_abnormal": n_abnormal, "operational_anomalies": op_anomalies,
-            "message": f"Events read from column: '{ec}'"}
+    statuses = raw_vals.apply(_clf)
+    return {"has_events":True,"event_col":ec,"event_counts":event_counts,
+            "event_labels":raw_vals.values,
+            "n_active":int((statuses=="active").sum()),
+            "n_inactive":int((statuses=="inactive").sum()),
+            "n_abnormal":int((anomaly_labels==-1).sum()),
+            "operational_anomalies":[],"message":f"Events from '{ec}'"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PER-PARAMETER ANOMALY ANALYSIS
+# BUILD ANOMALY DETECTION MATRIX
 # ══════════════════════════════════════════════════════════════════════════════
-def analyse_per_parameter(df, x_cols, z_threshold=2.5):
-    import scipy.stats as sp_stats
-    results = []
-    for col in x_cols:
-        if col not in df.columns: continue
-        series = df[col].dropna()
-        if len(series) < 5: continue
-        vals  = series.values.astype(float)
-        mean  = float(np.mean(vals)); std = float(np.std(vals))
-        if std == 0: continue
-        z_scores  = (vals - mean) / std
-        anom_mask = np.abs(z_scores) > z_threshold
-        n_anom    = int(anom_mask.sum()); n_total = len(vals)
-        pct  = n_anom / n_total * 100
-        skew = float(sp_stats.skew(vals)); kurt = float(sp_stats.kurtosis(vals))
-        min_v, max_v = float(vals.min()), float(vals.max())
-        median = float(np.median(vals))
-        if pct == 0:           severity = "NONE"
-        elif pct < 3:          severity = "LOW"
-        elif pct < 10:         severity = "MODERATE"
-        elif pct < 25:         severity = "ELEVATED"
-        else:                  severity = "HIGH"
-        reason_parts = []
-        if n_anom == 0:
-            reason_parts.append("All values within normal statistical range.")
-        else:
-            high_out = int((z_scores > z_threshold).sum())
-            low_out  = int((z_scores < -z_threshold).sum())
-            if high_out > 0 and low_out > 0:
-                reason_parts.append(f"Outliers on BOTH ends: {high_out} above and {low_out} below threshold.")
-            elif high_out > 0:
-                reason_parts.append(f"{high_out} records exceed upper threshold ({mean+z_threshold*std:.2f}).")
-            else:
-                reason_parts.append(f"{low_out} records below lower threshold ({mean-z_threshold*std:.2f}).")
-            if abs(skew) > 1.5:
-                d = "right" if skew > 0 else "left"
-                reason_parts.append(f"Strongly skewed {d} (skew={skew:.2f}).")
-            range_ratio = (max_v - min_v) / (abs(mean) + 1e-9)
-            if range_ratio > 5:
-                reason_parts.append(f"Wide value range ({min_v:.2f}–{max_v:.2f}) — possible sensor fault.")
-        results.append({
-            "col": col, "n_total": n_total, "n_anom": n_anom, "pct": pct,
-            "mean": mean, "std": std, "median": median, "min": min_v, "max": max_v,
-            "skew": skew, "kurt": kurt, "severity": severity,
-            "reason": " ".join(reason_parts), "z_threshold": z_threshold,
-            "high_out": int((z_scores > z_threshold).sum()) if n_anom else 0,
-            "low_out":  int((z_scores < -z_threshold).sum()) if n_anom else 0,
+def build_anomaly_X(well_df, num_agg_cols, cat_agg_cols, weight_map):
+    import pandas as pd
+    n = len(well_df)
+    cols = []
+
+    if num_agg_cols:
+        raw = well_df[num_agg_cols].values.astype(float)
+        raw = _impute_numeric(raw)
+        mu = raw.mean(axis=0); s = raw.std(axis=0); s[s==0] = 1.0
+        X_scaled = (raw - mu) / s
+        for j, c in enumerate(num_agg_cols):
+            orig = (c.replace("__mean","").replace("__std","")
+                     .replace("__min","").replace("__max",""))
+            w = float(weight_map.get(orig, 1.0))
+            cols.append((X_scaled[:, j] * np.sqrt(w/100.0 if w <= 100 else 1.0)).reshape(-1, 1))
+
+    if cat_agg_cols:
+        for c in cat_agg_cols:
+            vals = well_df[c].fillna("MISSING").astype(str).values
+            codes = pd.Categorical(vals).codes.astype(float)
+            lo, hi = codes.min(), codes.max()
+            rng = hi - lo if hi != lo else 1.0
+            cols.append(((codes - lo) / rng).reshape(-1, 1))
+
+    if not cols:
+        return np.zeros((n, 1))
+    return np.hstack(cols)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DETAILED ANOMALY EXPLANATION — per well, per parameter
+# ══════════════════════════════════════════════════════════════════════════════
+def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
+                             anomaly_scores, well_id_col, z_threshold=2.5):
+    """
+    For each anomalous well: identify WHICH parameters are out of range,
+    compute z-scores, explain WHY, and return structured list of dicts.
+    """
+    import pandas as pd
+
+    anom_idx = np.where(anomaly_labels == -1)[0]
+    if len(anom_idx) == 0:
+        return []
+
+    # Compute global stats on numeric agg cols across ALL wells
+    num_stats = {}
+    for c in num_agg_cols:
+        vals = well_df[c].dropna().values.astype(float)
+        if len(vals) == 0:
+            continue
+        mu = float(np.mean(vals))
+        sd = float(np.std(vals))
+        if sd == 0:
+            sd = 1.0
+        num_stats[c] = {"mean": mu, "std": sd,
+                        "p10": float(np.percentile(vals, 10)),
+                        "p90": float(np.percentile(vals, 90))}
+
+    explanations = []
+    for idx in anom_idx:
+        row = well_df.iloc[idx]
+        well_name = str(row[well_id_col]) if (well_id_col and well_id_col in well_df.columns) else f"Well #{idx}"
+        score = float(anomaly_scores[idx]) if idx < len(anomaly_scores) else 0.0
+
+        flagged_params = []
+        # Numeric analysis
+        for c in num_agg_cols:
+            if c not in num_stats:
+                continue
+            val = row.get(c, np.nan)
+            if pd.isna(val):
+                flagged_params.append({
+                    "param": c, "value": "MISSING",
+                    "z_score": None,
+                    "direction": "missing",
+                    "reason": "Value is missing / NaN"
+                })
+                continue
+            val = float(val)
+            st = num_stats[c]
+            z = (val - st["mean"]) / st["std"]
+            if abs(z) > z_threshold:
+                direction = "HIGH" if z > 0 else "LOW"
+                flagged_params.append({
+                    "param": c,
+                    "value": round(val, 4),
+                    "z_score": round(z, 3),
+                    "direction": direction,
+                    "mean": round(st["mean"], 4),
+                    "std": round(st["std"], 4),
+                    "p10": round(st["p10"], 4),
+                    "p90": round(st["p90"], 4),
+                    "reason": (f"Value {val:.4f} is {abs(z):.2f}σ "
+                               f"{'above' if z>0 else 'below'} mean "
+                               f"({st['mean']:.4f}±{st['std']:.4f}). "
+                               f"Normal range P10–P90: {st['p10']:.4f}–{st['p90']:.4f}.")
+                })
+
+        # Categorical analysis — compare to global mode
+        for c in cat_agg_cols:
+            val = str(row.get(c, "MISSING"))
+            all_vals = well_df[c].fillna("MISSING").astype(str)
+            global_mode = str(all_vals.mode().iloc[0]) if len(all_vals.mode()) > 0 else "UNKNOWN"
+            freq = (all_vals == val).sum() / max(len(all_vals), 1) * 100
+            if freq < 5:  # rare category
+                flagged_params.append({
+                    "param": c,
+                    "value": val,
+                    "z_score": None,
+                    "direction": "RARE CATEGORY",
+                    "reason": (f"Category '{val}' is rare ({freq:.1f}% of wells). "
+                               f"Most common: '{global_mode}'.")
+                })
+
+        # Sort by |z_score| descending
+        flagged_params.sort(key=lambda x: abs(x.get("z_score") or 0), reverse=True)
+
+        explanations.append({
+            "well": well_name,
+            "index": int(idx),
+            "anomaly_score": score,
+            "flagged_params": flagged_params,
+            "n_flagged": len(flagged_params)
         })
-    results.sort(key=lambda r: r["n_anom"], reverse=True)
-    return results
+
+    # Sort by anomaly score (most anomalous first)
+    explanations.sort(key=lambda x: x["anomaly_score"])
+    return explanations
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1031,535 +1000,228 @@ def _style_ax(ax):
     for sp in ax.spines.values(): sp.set_edgecolor("#2d3f5e")
     ax.tick_params(colors="#94a3b8", labelsize=8)
 
-
-def plot_clusters(df, xcols, ycols, hex_colors):
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    x_col = xcols[0] if xcols else None
-    y_col = (ycols[0] if ycols else (xcols[1] if len(xcols) > 1 else xcols[0] if xcols else None))
-    if x_col and y_col and x_col in df.columns and y_col in df.columns:
-        for cl in sorted(df["cluster"].unique()):
-            mask = df["cluster"] == cl; col = hex_colors[int(cl) % len(hex_colors)]
-            ax.scatter(df.loc[mask, x_col], df.loc[mask, y_col], color=col, s=55,
-                       edgecolors="#ffffff22", linewidths=0.5, zorder=3,
-                       label=f"Cluster {cl}  ({int(mask.sum()):,} wells)")
-        ax.set_xlabel(x_col, fontsize=9); ax.set_ylabel(y_col, fontsize=9)
-    else:
-        ax.text(0.2, 0.5, "Select X and Y features to plot",
-                transform=ax.transAxes, color=FG_DIM, fontsize=10)
-    ax.set_title("CBM Well Clusters  (per-well profiles)", color=COL_CLUSTER,
-                 fontsize=13, pad=12, fontweight="bold")
-    ax.legend(loc="upper left", fontsize=8.5, framealpha=0.92,
-              edgecolor="#334155", facecolor="#161d2e", labelcolor="#e2e8f0", markerscale=1.4)
-    return fig
-
-
-def plot_pca(X, labels, hex_colors):
+def plot_well_clusters(well_df, agg_cols, hx, cluster_method=""):
     from sklearn.decomposition import PCA
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    if X.shape[0] < 2 or X.shape[1] < 1:
-        ax.text(0.3, 0.5, "Not enough data for PCA", transform=ax.transAxes, color=FG_DIM)
-        return fig
-    n = min(2, X.shape[1])
-    Z = PCA(n_components=n).fit_transform(X)
-    if Z.shape[1] == 1: Z = np.hstack([Z, np.zeros_like(Z)])
-    for cl in sorted(np.unique(labels)):
-        mask = labels == cl; col = hex_colors[int(cl) % len(hex_colors)]
-        ax.scatter(Z[mask, 0], Z[mask, 1], color=col, s=55,
-                   edgecolors="#ffffff22", linewidths=0.5, zorder=3,
-                   label=f"Cluster {cl}  ({int(mask.sum()):,} wells)")
-    ax.set_xlabel("PC 1", fontsize=9); ax.set_ylabel("PC 2", fontsize=9)
-    ax.set_title("PCA — Well Feature Space", color=COL_CLUSTER, fontsize=13, pad=12, fontweight="bold")
+    import pandas as pd
+    fig, ax = plt.subplots(figsize=(7.5,4.5)); _style_ax(ax)
+
+    valid_cols = [c for c in agg_cols if c in well_df.columns]
+
+    if len(valid_cols) >= 1 and "cluster" in well_df.columns:
+        encoded_cols = []
+        for c in valid_cols:
+            col_data = well_df[c]
+            if pd.api.types.is_numeric_dtype(col_data):
+                arr = col_data.fillna(col_data.mean() if col_data.notna().any() else 0).values.astype(float)
+            else:
+                arr = pd.Categorical(col_data.fillna("MISSING").astype(str)).codes.astype(float)
+            lo, hi = arr.min(), arr.max()
+            rng = hi - lo if hi != lo else 1.0
+            encoded_cols.append(((arr - lo) / rng).reshape(-1, 1))
+
+        if not encoded_cols:
+            ax.text(0.2, 0.5, "No usable feature columns", transform=ax.transAxes,
+                    color=FG_DIM, fontsize=10)
+        else:
+            data = np.hstack(encoded_cols)
+            data = _impute_numeric(data)
+
+            n_components = min(2, data.shape[1], data.shape[0] - 1)
+            if n_components >= 2:
+                Z = PCA(n_components=2, random_state=42).fit_transform(data)
+            elif n_components == 1:
+                Z = np.column_stack([data[:, 0], np.arange(len(data)) / max(len(data)-1, 1)])
+            else:
+                Z = np.column_stack([np.arange(len(data)), np.zeros(len(data))])
+
+            unique_clusters = sorted(well_df["cluster"].unique())
+            for cl in unique_clusters:
+                mask = well_df["cluster"].values == cl
+                col = hx[int(cl) % len(hx)]
+                ax.scatter(Z[mask, 0], Z[mask, 1], color=col, s=80,
+                           edgecolors="#ffffff44", linewidths=0.7, zorder=3,
+                           label=f"Cluster {cl}  ({int(mask.sum()):,} wells)")
+
+            ax.set_xlabel("PC 1  (combined well profile)", fontsize=9)
+            ax.set_ylabel("PC 2  (combined well profile)", fontsize=9)
+    else:
+        ax.text(0.2, 0.5, "Not enough data to plot", transform=ax.transAxes, color=FG_DIM, fontsize=10)
+
+    method_tag = f"  [{cluster_method}]" if cluster_method else ""
+    n_wells = len(well_df)
+    n_cl = well_df["cluster"].nunique() if "cluster" in well_df.columns else 0
+    ax.set_title(f"Well Clusters{method_tag}\n{n_wells:,} wells  ·  {n_cl} clusters  ·  "
+                 f"{len(valid_cols)} features used",
+                 color=COL_CLUSTER, fontsize=11, pad=10, fontweight="bold")
     ax.legend(loc="upper left", fontsize=8.5, framealpha=0.92,
               edgecolor="#334155", facecolor="#161d2e", labelcolor="#e2e8f0", markerscale=1.4)
+    ax.margins(0.10)
     return fig
 
-
-def plot_reservoir_3d(df, xcols, ycols, hex_colors):
-    from mpl_toolkits.mplot3d import Axes3D  # noqa
-    fig = plt.figure(figsize=(7.5, 4.5))
-    ax  = fig.add_subplot(111, projection="3d")
-    ax.set_facecolor("#161d2e"); ax.tick_params(colors="#94a3b8", labelsize=7)
-    cols3 = list(dict.fromkeys(xcols + ycols))[:3]
-    if len(cols3) < 3:
-        extra = [c for c in df.select_dtypes(include="number").columns
-                 if c not in cols3 and c != "cluster"]
-        cols3 = (cols3 + extra)[:3]
-    if len(cols3) == 3 and all(c in df.columns for c in cols3):
-        handles = []
-        for cl in sorted(df["cluster"].unique()):
-            mask = df["cluster"] == cl; col = hex_colors[int(cl) % len(hex_colors)]
-            ax.scatter(df.loc[mask, cols3[0]], df.loc[mask, cols3[1]], df.loc[mask, cols3[2]],
-                       color=col, s=35, edgecolors="#ffffff15", linewidths=0.3)
-            handles.append(mpatches.Patch(color=col, label=f"Cluster {cl}  ({int(mask.sum()):,})"))
-        ax.set_xlabel(cols3[0], color="#94a3b8", fontsize=7)
-        ax.set_ylabel(cols3[1], color="#94a3b8", fontsize=7)
-        ax.set_zlabel(cols3[2], color="#94a3b8", fontsize=7)
-        ax.legend(handles=handles, loc="upper left", fontsize=8, framealpha=0.85,
-                  facecolor="#161d2e", edgecolor="#334155", labelcolor="#e2e8f0")
-    ax.set_title("3D Reservoir Map", color=COL_DATASET, fontsize=13, pad=8, fontweight="bold")
+def plot_pca(X, labels, hex_colors, cluster_method=""):
+    from sklearn.decomposition import PCA
+    fig, ax = plt.subplots(figsize=(7.5,4.5)); _style_ax(ax)
+    if X.shape[0]<2 or X.shape[1]<1:
+        ax.text(0.3,0.5,"Not enough data",transform=ax.transAxes,color=FG_DIM); return fig
+    n = min(2, X.shape[1]); Z = PCA(n_components=n).fit_transform(X)
+    if Z.shape[1]==1: Z = np.hstack([Z,np.zeros_like(Z)])
+    for cl in sorted(np.unique(labels)):
+        mask=labels==cl; col=hex_colors[int(cl)%len(hex_colors)]
+        ax.scatter(Z[mask,0],Z[mask,1],color=col,s=55,
+                   edgecolors="#ffffff22",linewidths=0.5,zorder=3,
+                   label=f"Cluster {cl}  ({int(mask.sum()):,} wells)")
+    ax.set_xlabel("PC 1",fontsize=9); ax.set_ylabel("PC 2",fontsize=9)
+    method_tag = f"  [{cluster_method}]" if cluster_method else ""
+    ax.set_title(f"PCA — Well Feature Space{method_tag}",color=COL_CLUSTER,fontsize=12,pad=12,fontweight="bold")
+    ax.legend(loc="upper left",fontsize=8.5,framealpha=0.92,
+              edgecolor="#334155",facecolor="#161d2e",labelcolor="#e2e8f0",markerscale=1.4)
     return fig
-
-
-def plot_production(df, ycols, xcols, hex_colors):
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    y_col = next((c for c in ycols if c in df.columns), None) or \
-            next((c for c in xcols if c in df.columns), None)
-    x_col = next((c for c in xcols if c in df.columns and c != y_col), None)
-    if y_col is None:
-        ax.text(0.2, 0.5, "Select a Y feature for production curve",
-                transform=ax.transAxes, color=FG_DIM, fontsize=10)
-        return fig
-    for cl in sorted(df["cluster"].unique()):
-        sub = df[df["cluster"] == cl].reset_index(drop=True)
-        col = hex_colors[int(cl) % len(hex_colors)]
-        xs  = sub[x_col].values if x_col else np.arange(len(sub))
-        ax.plot(xs, sub[y_col].values, color=col, linewidth=2, alpha=0.88,
-                label=f"Cluster {cl}  ({len(sub):,})")
-    ax.set_xlabel(x_col if x_col else "Well Index", fontsize=9)
-    ax.set_ylabel(y_col, fontsize=9)
-    ax.set_title("Production Curves by Cluster", color=SUCCESS2, fontsize=13, pad=12, fontweight="bold")
-    ax.legend(loc="upper left", fontsize=8.5, framealpha=0.92,
-              edgecolor="#334155", facecolor="#161d2e", labelcolor="#e2e8f0")
-    return fig
-
 
 def plot_hidden_patterns(X_w, anomaly_labels, xcols, detector_name):
     from sklearn.decomposition import PCA
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
+    fig,ax = plt.subplots(figsize=(7.5,4.5)); _style_ax(ax)
     n = X_w.shape[0]
-    if X_w.shape[1] >= 2:
-        Z = PCA(n_components=2, random_state=42).fit_transform(X_w)
-        xlabel, ylabel = "PC 1  (feature projection)", "PC 2  (feature projection)"
-    elif X_w.shape[1] == 1:
-        Z = np.column_stack([X_w[:, 0], np.arange(n)])
+    if X_w.shape[1]>=2:
+        Z = PCA(n_components=2,random_state=42).fit_transform(X_w)
+        xlabel,ylabel = "PC 1  (feature projection)","PC 2  (feature projection)"
+    elif X_w.shape[1]==1:
+        Z = np.column_stack([X_w[:,0],np.arange(n)])
         xlabel = xcols[0] if xcols else "Feature"; ylabel = "Well Index"
     else:
-        ax.text(0.3, 0.5, "No feature data", transform=ax.transAxes, color=FG_DIM); return fig
-    nm = anomaly_labels == 1; am = anomaly_labels == -1
-    ax.scatter(Z[nm, 0], Z[nm, 1], color=NORMAL_C, s=35, alpha=0.70,
-               edgecolors="#ffffff18", linewidths=0.3, zorder=3,
+        ax.text(0.3,0.5,"No feature data",transform=ax.transAxes,color=FG_DIM); return fig
+    nm=anomaly_labels==1; am=anomaly_labels==-1
+    ax.scatter(Z[nm,0],Z[nm,1],color=NORMAL_C,s=35,alpha=0.70,
+               edgecolors="#ffffff18",linewidths=0.3,zorder=3,
                label=f"● Normal  ({int(nm.sum()):,} wells)")
-    if am.sum() > 0:
-        ax.scatter(Z[am, 0], Z[am, 1], color=ANOMALY_C, s=80, alpha=0.95,
-                   edgecolors="#ffffff66", linewidths=0.9, marker="D", zorder=5,
+    if am.sum()>0:
+        ax.scatter(Z[am,0],Z[am,1],color=ANOMALY_C,s=80,alpha=0.95,
+                   edgecolors="#ffffff66",linewidths=0.9,marker="D",zorder=5,
                    label=f"◆ Anomalous  ({int(am.sum()):,} wells)")
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.92,
-              edgecolor="#334155", facecolor="#161d2e", labelcolor="#e2e8f0", markerscale=1.3)
-    ax.set_xlabel(xlabel, fontsize=9); ax.set_ylabel(ylabel, fontsize=9)
+        ax.annotate(f"◆ {int(am.sum())} anomalous",
+                    xy=(Z[am,0].mean(),Z[am,1].mean()),xytext=(14,14),
+                    textcoords="offset points",color=ANOMALY_C,fontsize=9,fontweight="bold",
+                    arrowprops=dict(arrowstyle="->",color=ANOMALY_C,lw=1.0))
+    ax.legend(loc="upper right",fontsize=9,framealpha=0.92,
+              edgecolor="#334155",facecolor="#161d2e",labelcolor="#e2e8f0",markerscale=1.3)
+    ax.set_xlabel(xlabel,fontsize=9); ax.set_ylabel(ylabel,fontsize=9)
     ax.set_title(f"Hidden Pattern Detection  ·  {detector_name}",
-                 color=ANOMALY_C, fontsize=12, pad=12, fontweight="bold")
+                 color=ANOMALY_C,fontsize=12,pad=12,fontweight="bold")
     ax.margins(0.10); return fig
 
-
-def plot_weight_chart(weight_map, method_desc):
-    if not weight_map:
-        fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-        ax.text(0.3, 0.5, "Run analysis first", transform=ax.transAxes, color=FG_DIM, fontsize=11)
-        ax.set_title("Parameter Importance", color=COL_WEIGHTS, fontsize=13, pad=12, fontweight="bold")
-        return fig
-    params = list(weight_map.keys()); values = [weight_map[p] for p in params]
-    sorted_pairs = sorted(zip(values, params)); values_s = [v for v, _ in sorted_pairs]
-    params_s = [p for _, p in sorted_pairs]
-    colors = [CLUSTER_PALETTE[i % len(CLUSTER_PALETTE)] for i in range(len(params_s))]
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    bars = ax.barh(params_s, values_s, color=colors, edgecolor="#ffffff22", linewidth=0.5, height=0.6)
-    for bar, val in zip(bars, values_s):
-        ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
-                f"{val:.1f}%", va="center", ha="left", color=FG_MID, fontsize=8.5)
-    ax.set_xlabel("Assigned Weight (%)", fontsize=9)
-    ax.set_title("Parameter Importance  —  User-Assigned Weights",
-                 color=COL_WEIGHTS, fontsize=12, pad=12, fontweight="bold")
-    ax.set_xlim(0, max(values_s) * 1.22); fig.patch.set_facecolor("#0d1117"); return fig
-
-
 def plot_event_chart(df, event_result):
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
+    fig,ax=plt.subplots(figsize=(7.5,4.5)); _style_ax(ax)
     if not event_result["has_events"]:
-        ax.text(0.3, 0.5, "No event column found", transform=ax.transAxes, color=FG_DIM, fontsize=11)
-        ax.set_title("Operational Events", color=COL_EVENTS, fontsize=13, pad=12, fontweight="bold")
-        return fig
-    counts = event_result["event_counts"]
-    labels = list(counts.keys()); sizes = list(counts.values())
-    colors_ev = []
+        ax.text(0.3,0.5,"No event column found",transform=ax.transAxes,color=FG_DIM,fontsize=11)
+        ax.set_title("Operational Events",color=COL_EVENTS,fontsize=13,pad=12,fontweight="bold"); return fig
+    counts=event_result["event_counts"]; labels=list(counts.keys()); sizes=list(counts.values())
+    colors_ev=[]
     for lbl in labels:
-        ll = lbl.lower()
-        matched = next((c for k, c in EVENT_COLOURS.items() if k in ll), None)
-        colors_ev.append(matched or CLUSTER_PALETTE[len(colors_ev) % len(CLUSTER_PALETTE)])
-    ax.barh(labels, sizes, color=colors_ev, edgecolor="#ffffff22", linewidth=0.5)
-    for i, (lbl, cnt) in enumerate(zip(labels, sizes)):
-        ax.text(cnt * 1.01, i, f"{cnt:,}", va="center", ha="left", color=FG_MID, fontsize=8)
-    ax.set_xlabel("Record Count", fontsize=9)
-    ax.set_title(f"Operational Events  —  col: '{event_result['event_col']}'",
-                 color=COL_EVENTS, fontsize=12, pad=12, fontweight="bold")
-    ax.margins(0.04, 0.15); fig.patch.set_facecolor("#0d1117"); return fig
-
-
-def plot_rpm_chart(df, rpm_result):
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    if not rpm_result["found"]:
-        ax.text(0.3, 0.5, "No RPM column found", transform=ax.transAxes, color=FG_DIM, fontsize=11)
-        ax.set_title("RPM Status", color="#f97316", fontsize=13, pad=12, fontweight="bold")
-        return fig
-    labels = ["Running\n(RPM>0)", "Stopped\n(RPM=0)", "Reverse\n(RPM<0)", "No Data"]
-    values = [rpm_result["running"], rpm_result["stopped"],
-              rpm_result["reverse"], rpm_result["no_data"]]
-    colors = ["#10b981", "#f59e0b", "#ef4444", "#4a6080"]
-    bars = ax.bar(labels, values, color=colors, edgecolor="#ffffff22", linewidth=0.5, width=0.6)
-    for bar, val in zip(bars, values):
-        if val > 0:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(values) * 0.01,
-                    f"{val:,}", ha="center", va="bottom", color=FG_MID, fontsize=9)
-    ax.set_title(f"RPM Status  —  col: '{rpm_result['col']}'",
-                 color="#f97316", fontsize=13, pad=12, fontweight="bold")
-    ax.margins(0.10, 0.15); fig.patch.set_facecolor("#0d1117"); return fig
-
-
-def plot_param_anomaly(param_anom_list, df=None, anomaly_labels=None):
-    if not param_anom_list:
-        fig, ax = plt.subplots(figsize=(10, 5)); fig.patch.set_facecolor("#0d1117"); _style_ax(ax)
-        ax.text(0.35, 0.5, "Run analysis first", transform=ax.transAxes, color=FG_DIM, fontsize=12)
-        ax.set_title("Per-Parameter: Normal vs Anomalous", color=COL_PARAM_ANOM, fontsize=12, pad=10)
-        return fig
-    items = [r for r in param_anom_list if r["n_total"] > 0]
-    if not items:
-        fig, ax = plt.subplots(figsize=(10, 5)); fig.patch.set_facecolor("#0d1117"); _style_ax(ax)
-        ax.text(0.3, 0.5, "No usable parameters", transform=ax.transAxes, color=FG_DIM)
-        return fig
-    n_params = len(items)
-    fig_h = max(6.0, n_params * 1.05 + 2.2)
-    fig = plt.figure(figsize=(14, fig_h)); fig.patch.set_facecolor("#0d1117")
-    fig.text(0.5, 0.985, "Per-Parameter Analysis: Normal vs Anomalous",
-             ha="center", va="top", color=COL_PARAM_ANOM, fontsize=11, fontweight="bold")
-    gs = gridspec.GridSpec(1, 2, width_ratios=[2, 3], wspace=0.06,
-                           left=0.01, right=0.99, top=0.93, bottom=0.07)
-    ax_bar = fig.add_subplot(gs[0]); _style_ax(ax_bar)
-    y_pos = np.arange(n_params)
-    norm_counts = [r["n_total"] - r["n_anom"] for r in items]
-    anom_counts = [r["n_anom"] for r in items]
-    totals = [n + a for n, a in zip(norm_counts, anom_counts)]
-    sev_cols = [SEV_COLORS.get(r["severity"], "#8b5cf6") for r in items]
-    param_labels = [r["col"] for r in items]
-    ax_bar.barh(y_pos, norm_counts, height=0.60, color=NORMAL_C,
-                edgecolor="#ffffff18", linewidth=0.3, label="Normal", zorder=3)
-    ax_bar.barh(y_pos, anom_counts, height=0.60, left=norm_counts, color="#ef4444",
-                edgecolor="#ffffff22", linewidth=0.3, label="Anomalous", zorder=3)
-    max_total = max(totals) if totals else 1
-    for i in range(n_params):
-        nn, na, tot = norm_counts[i], anom_counts[i], totals[i]
-        pct_a = na / max(tot, 1) * 100
-        if nn / max_total > 0.18:
-            ax_bar.text(nn / 2, i, f"{nn:,}  ({100-pct_a:.1f}%)",
-                        va="center", ha="center", color="#fff", fontsize=7.5, fontweight="bold", zorder=5)
-        if na > 0:
-            red_center = nn + na / 2
-            label_str = f"{na:,}  ({pct_a:.1f}%)"
-            if na / max_total > 0.10:
-                ax_bar.text(red_center, i, label_str, va="center", ha="center",
-                            color="#fff", fontsize=7.5, fontweight="bold", zorder=5)
-            else:
-                ax_bar.text(tot + max_total * 0.01, i, label_str,
-                            va="center", ha="left", color="#ef4444", fontsize=7, zorder=5)
-        verdict = "✔ CLEAN" if items[i]["severity"] == "NONE" else items[i]["severity"]
-        ax_bar.text(max_total * 1.02, i, verdict, va="center", ha="left",
-                    color=sev_cols[i], fontsize=7.5, fontweight="bold")
-    ax_bar.set_yticks(y_pos); ax_bar.set_yticklabels(param_labels, fontsize=max(6.5, 9 - n_params * 0.25), color=FG_MID)
-    ax_bar.set_xlabel("Record Count", fontsize=8.5, color="#94a3b8"); ax_bar.set_xlim(0, max_total * 1.25)
-    ax_bar.set_ylim(-0.6, n_params - 0.4); ax_bar.invert_yaxis()
-    ax_bar.set_title("Normal vs Anomalous\nper Parameter", color="#94a3b8", fontsize=8.5, pad=6)
-    ax_bar.legend(loc="lower right", fontsize=7.5, framealpha=0.88,
-                  facecolor="#161d2e", edgecolor="#334155", labelcolor="#e2e8f0")
-    # Right: box plots if we have data
-    if df is not None and anomaly_labels is not None:
-        gs_right = gridspec.GridSpecFromSubplotSpec(n_params, 1, subplot_spec=gs[1], hspace=0.55)
-        rng = np.random.default_rng(42)
-        for i, r in enumerate(items):
-            col = r["col"]; ax_box = fig.add_subplot(gs_right[i]); _style_ax(ax_box)
-            if col not in df.columns: continue
-            norm_vals = df.loc[anomaly_labels == 1, col].dropna().values.astype(float)
-            anom_vals = df.loc[anomaly_labels == -1, col].dropna().values.astype(float)
-            if len(norm_vals) > 4000: norm_vals = rng.choice(norm_vals, 4000, replace=False)
-            if len(anom_vals) > 2000: anom_vals = rng.choice(anom_vals, 2000, replace=False)
-            data_to_plot = []; bp_labels = []; bp_colors = []
-            if len(norm_vals) > 0: data_to_plot.append(norm_vals); bp_labels.append("Normal"); bp_colors.append(NORMAL_C)
-            if len(anom_vals) > 0: data_to_plot.append(anom_vals); bp_labels.append("Anomalous"); bp_colors.append("#ef4444")
-            if data_to_plot:
-                bp = ax_box.boxplot(data_to_plot, vert=False, patch_artist=True, widths=0.42,
-                                    showfliers=True,
-                                    flierprops=dict(marker=".", markersize=2.5, markerfacecolor="#ef444488", markeredgecolor="none", alpha=0.45),
-                                    medianprops=dict(color="#ffffff", linewidth=1.8),
-                                    whiskerprops=dict(color="#94a3b8", linewidth=0.9),
-                                    capprops=dict(color="#94a3b8", linewidth=0.9),
-                                    boxprops=dict(linewidth=0.8))
-                for patch, c in zip(bp["boxes"], bp_colors):
-                    patch.set_facecolor(c); patch.set_alpha(0.70)
-            ax_box.set_yticks(range(1, len(bp_labels) + 1))
-            ax_box.set_yticklabels(bp_labels, fontsize=7.5, color=FG_MID)
-            ax_box.tick_params(axis="x", labelsize=6.5, colors="#94a3b8", pad=2, length=3)
-            sev_c = SEV_COLORS.get(r["severity"], "#8b5cf6")
-            verdict = "CLEAN" if r["severity"] == "NONE" else f"{r['severity']}  —  {anom_counts[i]:,} anomalous"
-            ax_box.set_title(f"{col}\n[{verdict}]", color=sev_c, fontsize=7.5, pad=3,
-                             fontweight="bold", loc="left", linespacing=1.3)
-    else:
-        ax_sc = fig.add_subplot(gs[1]); _style_ax(ax_sc)
-        pcts  = [r["pct"] for r in items]; skews = [abs(r["skew"]) for r in items]
-        ax_sc.scatter(skews, pcts, c=sev_cols, s=70, edgecolors="#ffffff33", linewidths=0.6, zorder=4)
-        for i, r in enumerate(items):
-            ax_sc.annotate(r["col"][:18], (skews[i], pcts[i]), xytext=(5, 4),
-                           textcoords="offset points", color=FG_DIM, fontsize=7)
-        ax_sc.set_xlabel("|Skewness|", fontsize=9); ax_sc.set_ylabel("Anomaly %", fontsize=9)
-        ax_sc.set_title("Anomaly % vs Skewness", color=COL_PARAM_ANOM, fontsize=10, pad=8)
-    return fig
+        ll=lbl.lower(); matched=next((c for k,c in EVENT_COLOURS.items() if k in ll),None)
+        colors_ev.append(matched or CLUSTER_PALETTE[len(colors_ev)%len(CLUSTER_PALETTE)])
+    ax.barh(labels,sizes,color=colors_ev,edgecolor="#ffffff22",linewidth=0.5)
+    for i,(lbl,cnt) in enumerate(zip(labels,sizes)):
+        ax.text(cnt*1.01,i,f"{cnt:,}",va="center",ha="left",color=FG_MID,fontsize=8)
+    ax.set_xlabel("Record Count",fontsize=9)
+    ax.set_title(f"Operational Events — '{event_result['event_col']}'",color=COL_EVENTS,fontsize=12,pad=12,fontweight="bold")
+    ax.margins(0.04,0.15); fig.patch.set_facecolor("#0d1117"); return fig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LEGEND BUILDERS
 # ══════════════════════════════════════════════════════════════════════════════
-def build_cluster_legend(parent, df=None, hex_colors=None):
+def build_cluster_legend(parent, df=None, hex_colors=None, cluster_method=""):
     for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="CLUSTERS", bg=CARD, fg=COL_CLUSTER,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_CLUSTER)
+    tk.Label(parent,text="CLUSTERS",bg=CARD,fg=COL_CLUSTER,font=FONT_H3,justify="center").pack(pady=(8,2),padx=6)
+    if cluster_method:
+        tk.Label(parent,text=cluster_method,bg=CARD,fg=FG_DIM,font=("Courier New",7),wraplength=180,justify="center").pack(padx=4,pady=(0,2))
+    _divider(parent,COL_CLUSTER)
     if df is None or "cluster" not in df.columns:
-        tk.Label(parent, text="Run analysis first", bg=CARD, fg=FG_DIM,
-                 font=FONT_XS, wraplength=170).pack(pady=8); return
-    total = len(df)
+        tk.Label(parent,text="Run analysis first",bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=170).pack(pady=8); return
+    total=len(df)
     for cl in sorted(df["cluster"].unique()):
-        cnt = int((df["cluster"] == cl).sum())
-        col = hex_colors[int(cl) % len(hex_colors)] if hex_colors else ACCENT
-        row = tk.Frame(parent, bg=CARD2, padx=5, pady=3,
-                       highlightbackground=col, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=2)
-        tk.Canvas(row, bg=col, width=10, height=10, highlightthickness=0).pack(side="left", padx=(0, 5))
-        txt = tk.Frame(row, bg=CARD2); txt.pack(side="left", fill="x", expand=True)
-        tk.Label(txt, text=f"Cluster {cl}", bg=CARD2, fg=col,
-                 font=("Courier New", 8, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(txt, text=f"{cnt:,} wells  ({cnt/total*100:.1f}%)", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7), anchor="w").pack(anchor="w")
-        _mini_bar(parent, "", cnt / total, col)
-
+        cnt=int((df["cluster"]==cl).sum()); col=hex_colors[int(cl)%len(hex_colors)] if hex_colors else ACCENT
+        row=tk.Frame(parent,bg=CARD2,padx=5,pady=3,highlightbackground=col,highlightthickness=1)
+        row.pack(fill="x",padx=5,pady=2)
+        tk.Canvas(row,bg=col,width=10,height=10,highlightthickness=0).pack(side="left",padx=(0,5))
+        txt=tk.Frame(row,bg=CARD2); txt.pack(side="left",fill="x",expand=True)
+        tk.Label(txt,text=f"Cluster {cl}",bg=CARD2,fg=col,font=("Courier New",8,"bold"),anchor="w").pack(anchor="w")
+        tk.Label(txt,text=f"{cnt:,} wells  ({cnt/total*100:.1f}%)",bg=CARD2,fg=FG_MID,font=("Courier New",7),anchor="w").pack(anchor="w")
+        _mini_bar(parent,"",cnt/total,col)
 
 def build_anomaly_legend(parent, n_normal=0, n_anomaly=0):
     for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="ANOMALY", bg=CARD, fg=COL_ANOMALY,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_ANOMALY)
-    total = max(n_normal + n_anomaly, 1)
-    for label, cnt, col in [("● Normal", n_normal, NORMAL_C), ("◆ Anomalous", n_anomaly, ANOMALY_C)]:
-        row = tk.Frame(parent, bg=CARD2, padx=5, pady=3,
-                       highlightbackground=col, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=2)
-        tk.Label(row, text=label, bg=CARD2, fg=col,
-                 font=("Courier New", 8, "bold")).pack(anchor="w")
-        tk.Label(row, text=f"{cnt:,}  ({cnt/total*100:.1f}%)", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7)).pack(anchor="w")
-        _mini_bar(parent, "", cnt / total, col)
-
-
-def build_param_anomaly_legend(parent, param_anom_list):
-    for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="PARAM STATUS", bg=CARD, fg=COL_PARAM_ANOM,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_PARAM_ANOM)
-    if not param_anom_list:
-        tk.Label(parent, text="Run analysis first", bg=CARD, fg=FG_DIM,
-                 font=FONT_XS, wraplength=170).pack(pady=8); return
-    for r in param_anom_list:
-        if r["n_total"] == 0: continue
-        sev_col = SEV_COLORS.get(r["severity"], "#8b5cf6")
-        n_norm  = r["n_total"] - r["n_anom"]; n_anom = r["n_anom"]
-        is_clean = (n_anom == 0)
-        card = tk.Frame(parent, bg=CARD2, padx=5, pady=4,
-                        highlightbackground=sev_col if not is_clean else SUCCESS,
-                        highlightthickness=1)
-        card.pack(fill="x", padx=5, pady=2)
-        tk.Label(card, text=r["col"][:22], bg=CARD2,
-                 fg=sev_col if not is_clean else SUCCESS2,
-                 font=("Courier New", 8, "bold"), anchor="w").pack(anchor="w")
-        norm_row = tk.Frame(card, bg=CARD2); norm_row.pack(fill="x")
-        tk.Label(norm_row, text="● Normal  :", bg=CARD2, fg=NORMAL_C,
-                 font=("Courier New", 7), width=11, anchor="w").pack(side="left")
-        tk.Label(norm_row, text=f"{n_norm:,}  ({100-r['pct']:.1f}%)", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7)).pack(side="left")
-        if n_anom > 0:
-            anom_row = tk.Frame(card, bg=CARD2); anom_row.pack(fill="x")
-            tk.Label(anom_row, text="◆ Anomaly :", bg=CARD2, fg="#ef4444",
-                     font=("Courier New", 7), width=11, anchor="w").pack(side="left")
-            tk.Label(anom_row, text=f"{n_anom:,}  ({r['pct']:.1f}%)", bg=CARD2, fg="#ef4444",
-                     font=("Courier New", 7, "bold")).pack(side="left")
-        else:
-            tk.Label(card, text="✔ All normal", bg=CARD2, fg=SUCCESS2,
-                     font=("Courier New", 7)).pack(anchor="w")
-        bar_frame = tk.Frame(card, bg=BORDER2, height=5); bar_frame.pack(fill="x", pady=(3, 0))
-        norm_frac = n_norm / max(r["n_total"], 1)
-        tk.Frame(bar_frame, bg=NORMAL_C, height=5).place(relwidth=norm_frac, relheight=1.0, relx=0)
-        if 1 - norm_frac > 0.01:
-            tk.Frame(bar_frame, bg="#ef4444", height=5).place(
-                relwidth=1-norm_frac, relheight=1.0, relx=norm_frac)
-    _divider(parent)
-    flagged = sum(1 for r in param_anom_list if r["n_anom"] > 0)
-    tk.Label(parent, text=f"Flagged: {flagged}  /  Clean: {len(param_anom_list)-flagged}",
-             bg=CARD, fg=FG_DIM, font=("Courier New", 7)).pack(anchor="w", padx=6, pady=(3, 4))
-
-
-def build_similarity_legend(parent, corr_matrix=None):
-    for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="SIMILARITY", bg=CARD, fg=COL_SIMILARITY,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_SIMILARITY)
-    if corr_matrix is None:
-        tk.Label(parent, text="Run analysis first", bg=CARD, fg=FG_DIM,
-                 font=FONT_XS, wraplength=170).pack(pady=8); return
-    tk.Label(parent, text="Top correlated pairs:", bg=CARD, fg=FG_MID,
-             font=FONT_XS).pack(anchor="w", padx=6, pady=(4, 2))
-    # Find top correlated pairs (excluding self)
-    pairs = []
-    cols = list(corr_matrix.columns)
-    for i, c1 in enumerate(cols):
-        for j, c2 in enumerate(cols):
-            if j <= i: continue
-            pairs.append((abs(corr_matrix.loc[c1, c2]), c1, c2, corr_matrix.loc[c1, c2]))
-    pairs.sort(reverse=True)
-    for abs_r, c1, c2, r in pairs[:8]:
-        col = "#ef4444" if abs_r > 0.8 else ("#f59e0b" if abs_r > 0.5 else "#10b981")
-        row = tk.Frame(parent, bg=CARD2, padx=4, pady=3,
-                       highlightbackground=col, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=1)
-        tk.Label(row, text=f"{c1[:14]}\n⟺ {c2[:14]}", bg=CARD2, fg=col,
-                 font=("Courier New", 7), anchor="w").pack(anchor="w")
-        tk.Label(row, text=f"r = {r:.3f}", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 8, "bold")).pack(anchor="w")
-    _divider(parent)
-    tk.Label(parent, text="Red = high correlation\nYellow = moderate\nGreen = low",
-             bg=CARD, fg=FG_DIM, font=("Courier New", 7), justify="left").pack(anchor="w", padx=6, pady=2)
-
-
-def build_weight_legend(parent, weight_map, method_desc):
-    for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="PARAM WEIGHTS", bg=CARD, fg=COL_WEIGHTS,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_WEIGHTS)
-    if not weight_map:
-        tk.Label(parent, text="Run analysis first", bg=CARD, fg=FG_DIM,
-                 font=FONT_XS, wraplength=170).pack(pady=8); return
-    total_w = max(sum(weight_map.values()), 1)
-    for i, (param, wt) in enumerate(sorted(weight_map.items(), key=lambda x: -x[1])):
-        col = CLUSTER_PALETTE[i % len(CLUSTER_PALETTE)]
-        row = tk.Frame(parent, bg=CARD2, padx=5, pady=3,
-                       highlightbackground=col, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=2)
-        tk.Canvas(row, bg=col, width=10, height=10, highlightthickness=0).pack(side="left", padx=(0, 5))
-        txt = tk.Frame(row, bg=CARD2); txt.pack(side="left", fill="x", expand=True)
-        tk.Label(txt, text=param[:20], bg=CARD2, fg=col,
-                 font=("Courier New", 8, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(txt, text=f"{wt:.1f}%", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7), anchor="w").pack(anchor="w")
-        _mini_bar(parent, "", wt / total_w, col)
-
+    tk.Label(parent,text="ANOMALY",bg=CARD,fg=COL_ANOMALY,font=FONT_H3,justify="center").pack(pady=(8,2),padx=6)
+    _divider(parent,COL_ANOMALY)
+    total=max(n_normal+n_anomaly,1)
+    for label,cnt,col in [("● Normal",n_normal,NORMAL_C),("◆ Anomalous",n_anomaly,ANOMALY_C)]:
+        row=tk.Frame(parent,bg=CARD2,padx=5,pady=3,highlightbackground=col,highlightthickness=1)
+        row.pack(fill="x",padx=5,pady=2)
+        tk.Label(row,text=label,bg=CARD2,fg=col,font=("Courier New",8,"bold")).pack(anchor="w")
+        tk.Label(row,text=f"{cnt:,}  ({cnt/total*100:.1f}%)",bg=CARD2,fg=FG_MID,font=("Courier New",7)).pack(anchor="w")
+        _mini_bar(parent,"",cnt/total,col)
 
 def build_event_legend(parent, event_result):
     for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="EVENT LEGEND", bg=CARD, fg=COL_EVENTS,
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, COL_EVENTS)
+    tk.Label(parent,text="EVENT LEGEND",bg=CARD,fg=COL_EVENTS,font=FONT_H3,justify="center").pack(pady=(8,2),padx=6)
+    _divider(parent,COL_EVENTS)
     if not event_result["has_events"]:
-        tk.Label(parent, text="No event column", bg=CARD, fg=WARN,
-                 font=FONT_SM, wraplength=170).pack(pady=8); return
-    counts = event_result["event_counts"]; total = max(sum(counts.values()), 1)
+        tk.Label(parent,text="No event column",bg=CARD,fg=WARN,font=FONT_SM,wraplength=170).pack(pady=8); return
+    counts=event_result["event_counts"]; total=max(sum(counts.values()),1)
     def _c(label):
-        ll = label.lower()
-        for k, c in EVENT_COLOURS.items():
+        ll=label.lower()
+        for k,c in EVENT_COLOURS.items():
             if k in ll: return c
-        return CLUSTER_PALETTE[hash(label) % len(CLUSTER_PALETTE)]
-    for label, cnt in sorted(counts.items(), key=lambda x: -x[1]):
-        col = _c(label)
-        row = tk.Frame(parent, bg=CARD2, padx=5, pady=3,
-                       highlightbackground=BORDER, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=2)
-        tk.Canvas(row, bg=col, width=10, height=10, highlightthickness=0).pack(side="left", padx=(0, 5))
-        txt = tk.Frame(row, bg=CARD2); txt.pack(side="left", fill="x", expand=True)
-        tk.Label(txt, text=label[:22], bg=CARD2, fg=col,
-                 font=("Courier New", 8, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(txt, text=f"{cnt:,}  ({cnt/total*100:.1f}%)", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7), anchor="w").pack(anchor="w")
-        _mini_bar(parent, "", cnt / total, col)
-
-
-def build_rpm_legend(parent, rpm_result):
-    for w in parent.winfo_children(): w.destroy()
-    tk.Label(parent, text="RPM LEGEND", bg=CARD, fg="#f97316",
-             font=FONT_H3, justify="center").pack(pady=(8, 2), padx=6)
-    _divider(parent, "#f97316")
-    if not rpm_result["found"]:
-        tk.Label(parent, text="No RPM column", bg=CARD, fg=WARN,
-                 font=FONT_SM, wraplength=170).pack(pady=8); return
-    total = max(rpm_result["running"] + rpm_result["stopped"] +
-                rpm_result["reverse"] + rpm_result["no_data"], 1)
-    for label, cnt, col in [
-        ("Running (RPM>0)", rpm_result["running"], "#10b981"),
-        ("Stopped (RPM=0)", rpm_result["stopped"], "#f59e0b"),
-        ("Reverse (RPM<0)", rpm_result["reverse"], "#ef4444"),
-        ("No Data",         rpm_result["no_data"], "#4a6080"),
-    ]:
-        if cnt == 0: continue
-        row = tk.Frame(parent, bg=CARD2, padx=5, pady=3,
-                       highlightbackground=col, highlightthickness=1)
-        row.pack(fill="x", padx=5, pady=2)
-        tk.Canvas(row, bg=col, width=10, height=10, highlightthickness=0).pack(side="left", padx=(0, 5))
-        txt = tk.Frame(row, bg=CARD2); txt.pack(side="left", fill="x", expand=True)
-        tk.Label(txt, text=label, bg=CARD2, fg=col,
-                 font=("Courier New", 8, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(txt, text=f"{cnt:,}  ({cnt/total*100:.1f}%)", bg=CARD2, fg=FG_MID,
-                 font=("Courier New", 7), anchor="w").pack(anchor="w")
-        _mini_bar(parent, "", cnt / total, col)
-
+        return CLUSTER_PALETTE[hash(label)%len(CLUSTER_PALETTE)]
+    for label,cnt in sorted(counts.items(),key=lambda x:-x[1]):
+        col=_c(label)
+        row=tk.Frame(parent,bg=CARD2,padx=5,pady=3,highlightbackground=BORDER,highlightthickness=1)
+        row.pack(fill="x",padx=5,pady=2)
+        tk.Canvas(row,bg=col,width=10,height=10,highlightthickness=0).pack(side="left",padx=(0,5))
+        txt=tk.Frame(row,bg=CARD2); txt.pack(side="left",fill="x",expand=True)
+        tk.Label(txt,text=label[:22],bg=CARD2,fg=col,font=("Courier New",8,"bold"),anchor="w").pack(anchor="w")
+        tk.Label(txt,text=f"{cnt:,}  ({cnt/total*100:.1f}%)",bg=CARD2,fg=FG_MID,font=("Courier New",7),anchor="w").pack(anchor="w")
+        _mini_bar(parent,"",cnt/total,col)
 
 def _fill_toolbar(bar, mpl_canvas, tab_name):
-    tk.Label(bar, text=" TOOLS:", bg="#080e1a", fg=FG_DIM, font=FONT_XS).pack(side="left", padx=(6, 2))
-    nav_frame = tk.Frame(bar, bg="#080e1a"); nav_frame.pack(side="left", padx=2)
-    tb = NavigationToolbar2Tk(mpl_canvas, nav_frame); tb.config(bg="#080e1a")
+    tk.Label(bar,text=" TOOLS:",bg="#080e1a",fg=FG_DIM,font=FONT_XS).pack(side="left",padx=(6,2))
+    nav_frame=tk.Frame(bar,bg="#080e1a"); nav_frame.pack(side="left",padx=2)
+    tb=NavigationToolbar2Tk(mpl_canvas,nav_frame); tb.config(bg="#080e1a")
     for child in tb.winfo_children():
-        try:
-            child.config(bg="#080e1a", fg=FG_MID, activebackground=CARD2,
-                         activeforeground=FG, relief="flat", bd=0, font=FONT_XS)
+        try: child.config(bg="#080e1a",fg=FG_MID,activebackground=CARD2,activeforeground=FG,relief="flat",bd=0,font=FONT_XS)
         except: pass
     tb.update()
-    tk.Frame(bar, bg=BORDER, width=1).pack(side="left", fill="y", padx=8, pady=3)
+    tk.Frame(bar,bg=BORDER,width=1).pack(side="left",fill="y",padx=8,pady=3)
     def _save_png():
-        fig = active_figures.get(tab_name)
-        if not fig: messagebox.showwarning("Export", "Run analysis first."); return
-        path = filedialog.asksaveasfilename(defaultextension=".png",
-                                            initialfile=f"cbm_{tab_name}_{ts()}.png",
-                                            filetypes=[("PNG", "*.png"), ("SVG", "*.svg")])
+        fig=active_figures.get(tab_name)
+        if not fig: messagebox.showwarning("Export","Run analysis first."); return
+        path=filedialog.asksaveasfilename(defaultextension=".png",initialfile=f"cbm_{tab_name}_{ts()}.png",
+                                          filetypes=[("PNG","*.png"),("SVG","*.svg")])
         if not path: return
-        fig.savefig(path, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
-        set_status(f"Saved: {os.path.basename(path)}", SUCCESS)
-    _icon_btn(bar, "Save Chart", _save_png, bg="#1e3a8a", fg="#93c5fd")
-
+        fig.savefig(path,dpi=180,bbox_inches="tight",facecolor=fig.get_facecolor())
+        set_status(f"Saved: {os.path.basename(path)}",SUCCESS)
+    _icon_btn(bar,"Save Chart",_save_png,bg="#1e3a8a",fg="#93c5fd")
 
 def draw_plot(tab_frame, fig, tab_name, legend_builder=None, legend_kwargs=None):
     for w in tab_frame.winfo_children(): w.destroy()
-    active_figures[tab_name] = fig
+    active_figures[tab_name]=fig
     try:
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            fig.tight_layout(pad=2.5, rect=[0.03, 0.03, 0.97, 0.95])
+            fig.tight_layout(pad=2.5,rect=[0.03,0.03,0.97,0.95])
     except: pass
     fig.patch.set_facecolor("#0d1117")
-    bar = tk.Frame(tab_frame, bg="#080e1a", pady=4,
-                   highlightbackground=BORDER, highlightthickness=1)
-    bar.pack(side="top", fill="x")
-    row = tk.Frame(tab_frame, bg=BG_MID); row.pack(side="top", fill="both", expand=True)
-    chart_frame = tk.Frame(row, bg=BG_MID); chart_frame.pack(side="left", fill="both", expand=True)
-    leg_frame = tk.Frame(row, bg=CARD, width=195,
-                         highlightbackground=BORDER, highlightthickness=1)
-    leg_frame.pack(side="right", fill="y", padx=(2, 6), pady=6)
-    leg_frame.pack_propagate(False)
-    mpl_canvas = FigureCanvasTkAgg(fig, master=chart_frame); mpl_canvas.draw()
-    cw = mpl_canvas.get_tk_widget(); cw.config(bg="#0d1117", highlightthickness=0)
-    cw.pack(fill="both", expand=True, padx=2, pady=2)
-    _fill_toolbar(bar, mpl_canvas, tab_name)
-    if legend_builder: legend_builder(leg_frame, **(legend_kwargs or {}))
+    bar=tk.Frame(tab_frame,bg="#080e1a",pady=4,highlightbackground=BORDER,highlightthickness=1)
+    bar.pack(side="top",fill="x")
+    row=tk.Frame(tab_frame,bg=BG_MID); row.pack(side="top",fill="both",expand=True)
+    chart_frame=tk.Frame(row,bg=BG_MID); chart_frame.pack(side="left",fill="both",expand=True)
+    leg_frame=tk.Frame(row,bg=CARD,width=195,highlightbackground=BORDER,highlightthickness=1)
+    leg_frame.pack(side="right",fill="y",padx=(2,6),pady=6); leg_frame.pack_propagate(False)
+    mpl_canvas=FigureCanvasTkAgg(fig,master=chart_frame); mpl_canvas.draw()
+    cw=mpl_canvas.get_tk_widget(); cw.config(bg="#0d1117",highlightthickness=0)
+    cw.pack(fill="both",expand=True,padx=2,pady=2)
+    _fill_toolbar(bar,mpl_canvas,tab_name)
+    if legend_builder: legend_builder(leg_frame,**(legend_kwargs or {}))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1567,164 +1229,139 @@ def draw_plot(tab_frame, fig, tab_name, legend_builder=None, legend_kwargs=None)
 # ══════════════════════════════════════════════════════════════════════════════
 def start_pipeline():
     if raw_data is None:
-        messagebox.showwarning("No Data", "Please upload a dataset first."); return
-    set_status("Running analysis…", WARN)
-    progress_start()
-    threading.Thread(target=run_pipeline, daemon=True).start()
-
+        messagebox.showwarning("No Data","Please upload a dataset first."); return
+    set_status("Running analysis…",WARN); progress_start()
+    threading.Thread(target=run_pipeline,daemon=True).start()
 
 def run_pipeline():
     global active_df, active_X, active_xcols, active_well_df
-    global active_anomaly_result, active_weight_result, active_event_result
-    global active_rpm_result, active_param_anom
+    global active_anomaly_result, active_event_result
+    global active_cluster_method, active_insights_text
 
     try:
-        # ── 1. Feature selection ───────────────────────────────────────────────
-        sel_num, sel_cat = get_selected_features()
-        all_num = list(raw_data.select_dtypes(include="number").columns)
-        x_cols  = sel_num if sel_num else all_num
-        if not x_cols:
-            app.after(0, lambda: set_status("No numeric features selected.", WARN))
+        import pandas as pd
+
+        selected_cols = get_selected_features()
+        if not selected_cols:
+            selected_cols = list(raw_data.select_dtypes(include="number").columns)
+        if not selected_cols:
+            app.after(0, lambda: set_status("No features selected.", WARN))
             app.after(0, progress_stop); return
 
-        app.after(0, lambda: set_status("Detecting well ID column…", WARN))
+        app.after(0, lambda: set_status(
+            f"Using {len(selected_cols)} features — aggregating by well…", WARN))
 
-        # ── 2. Find well ID & drop rows with all-NaN in x_cols ────────────────
         well_id_col = _find_well_id_column(raw_data)
-        needed = list(dict.fromkeys(x_cols))
-        wdf = raw_data.dropna(subset=needed).reset_index(drop=True)
+        wdf = raw_data.copy().reset_index(drop=True)
+
+        num_sel = [c for c in selected_cols
+                   if c in wdf.columns and pd.api.types.is_numeric_dtype(wdf[c])]
+        cat_sel = [c for c in selected_cols
+                   if c in wdf.columns and not pd.api.types.is_numeric_dtype(wdf[c])]
+
         n_rows = len(wdf)
-        n_unique_wells = wdf[well_id_col].nunique() if well_id_col else n_rows
+        n_unique_wells = wdf[well_id_col].nunique() if well_id_col and well_id_col in wdf.columns else n_rows
 
         app.after(0, lambda: set_status(
             f"Aggregating {n_rows:,} records → {n_unique_wells:,} wells…", WARN))
 
-        # ── 3. Aggregate per well (FAST on huge data) ──────────────────────────
-        well_df, wid_col_used = aggregate_by_well(wdf, x_cols, well_id_col)
+        well_df, num_agg_cols, cat_agg_cols = aggregate_by_well(wdf, selected_cols, well_id_col)
 
-        # Columns in well_df that are the "mean" of each original feature
-        # (used for clustering well profiles)
-        mean_cols = [f"{c}__mean" for c in x_cols if f"{c}__mean" in well_df.columns]
-        if not mean_cols:
-            # fallback: no aggregation happened (no well ID), use raw
-            mean_cols = [c for c in x_cols if c in well_df.columns]
+        if not num_agg_cols and not cat_agg_cols:
+            app.after(0, lambda: set_status("No columns could be aggregated.", ERR))
+            app.after(0, progress_stop); return
 
-        well_df_clean = well_df.dropna(subset=mean_cols).reset_index(drop=True)
+        all_agg = num_agg_cols + cat_agg_cols
+        well_df_clean = well_df.copy()
+        if all_agg:
+            num_ok = (well_df_clean[num_agg_cols].notna().any(axis=1)
+                      if num_agg_cols else pd.Series(False, index=well_df_clean.index))
+            cat_ok = (well_df_clean[cat_agg_cols].apply(
+                          lambda col: col.fillna("").astype(str).ne("") & col.fillna("").astype(str).ne("MISSING")
+                      ).any(axis=1)
+                      if cat_agg_cols else pd.Series(False, index=well_df_clean.index))
+            mask_valid = num_ok | cat_ok
+            well_df_clean = well_df_clean[mask_valid].reset_index(drop=True)
+
         n_wells = len(well_df_clean)
+        if n_wells < 2:
+            app.after(0, lambda: set_status(
+                f"Only {n_wells} well(s) after cleaning — need at least 2.", ERR))
+            app.after(0, progress_stop); return
 
-        app.after(0, lambda: set_status(
-            f"Computing weights + clustering {n_wells:,} wells…", WARN))
+        app.after(0, lambda: set_status(f"Clustering {n_wells:,} well profiles…", WARN))
 
-        # ── 4. Weights ─────────────────────────────────────────────────────────
-        weight_map, _ = get_manual_weights()
-        method_desc   = "User-assigned weights"
-        if not weight_map:
-            weight_map  = {c: round(100 / len(x_cols), 2) for c in x_cols}
-            method_desc = "Equal weights (auto)"
-        # Map weights to mean_cols (e.g., "pressure__mean" gets weight of "pressure")
-        mean_weight_map = {}
-        for mc in mean_cols:
-            orig = mc.replace("__mean", "")
-            mean_weight_map[mc] = weight_map.get(orig, 100 / len(mean_cols))
-        total_fw = sum(mean_weight_map.values()) or 1
-        mean_weight_map = {c: v / total_fw * 100 for c, v in mean_weight_map.items()}
+        # Equal weights
+        weight_map = {c: round(100/max(len(num_sel),1),2) for c in num_sel}
 
-        # ── 5. Cluster on WELL PROFILES ────────────────────────────────────────
-        X_well, use_mean_cols = build_weighted_X(well_df_clean, mean_cols, mean_weight_map)
         n_clusters = min(cluster_var.get(), n_wells)
-        cluster_labels, inertia = run_clustering(X_well, n_clusters)
+        cluster_labels, inertia, cluster_method = run_clustering_robust(
+            well_df_clean, num_agg_cols, cat_agg_cols, n_clusters, weight_map)
+
+        active_cluster_method = cluster_method
         well_df_clean = well_df_clean.copy()
         well_df_clean["cluster"] = cluster_labels
 
-        # Map cluster labels back to raw records
-        if wid_col_used and wid_col_used in wdf.columns:
-            cl_map = dict(zip(well_df_clean[wid_col_used], cluster_labels))
-            wdf["cluster"] = wdf[wid_col_used].map(cl_map).fillna(-1).astype(int)
+        if well_id_col and well_id_col in wdf.columns and well_id_col in well_df_clean.columns:
+            cl_map = dict(zip(well_df_clean[well_id_col], cluster_labels))
+            wdf["cluster"] = wdf[well_id_col].map(cl_map).fillna(-1).astype(int)
         else:
-            # No well ID — clusters align directly
-            wdf["cluster"] = cluster_labels[:len(wdf)] if len(cluster_labels) == len(wdf) else 0
+            wdf["cluster"] = 0
 
         app.after(0, lambda: set_status("Detecting anomalies…", WARN))
 
-        # ── 6. RPM status ─────────────────────────────────────────────────────
-        wdf, rpm_col_used, rpm_result = add_rpm_status_column(wdf)
+        X_anom = build_anomaly_X(well_df_clean, num_agg_cols, cat_agg_cols, weight_map)
 
-        # ── 7. Anomaly detection (on raw records, not well averages) ──────────
-        X_w_full, use_cols_full = build_weighted_X(wdf, x_cols, weight_map)
+        method  = anomaly_method_var.get()
+        contam  = anomaly_contam_var.get() / 100.0
+        a_labels_well, a_pct, a_idx, a_name, a_scores = detect_anomalies(
+            X_anom, contamination=contam, method=method)
+        well_df_clean["anomaly"] = a_labels_well
 
-        # RPM filter
-        if rpm_col_used and "RPM_Status" in wdf.columns:
-            allowed = []
-            if rpm_filter_all_var.get(): allowed = ["Running", "Stopped", "Reverse", "No Data"]
-            else:
-                if rpm_filter_running_var.get(): allowed.append("Running")
-                if rpm_filter_stopped_var.get(): allowed.append("Stopped")
-                if rpm_filter_reverse_var.get(): allowed.append("Reverse")
-                if rpm_filter_nodata_var.get():  allowed.append("No Data")
-            if allowed and len(allowed) < 4:
-                rpm_mask = wdf["RPM_Status"].isin(allowed)
-                X_w_anom = X_w_full[rpm_mask.values]
-                anom_filter_desc = f"RPM filter: {', '.join(allowed)}"
-            else:
-                X_w_anom = X_w_full; anom_filter_desc = "No RPM filter"
+        if well_id_col and well_id_col in wdf.columns and well_id_col in well_df_clean.columns:
+            anom_map = dict(zip(well_df_clean[well_id_col], a_labels_well))
+            wdf["anomaly"] = wdf[well_id_col].map(anom_map).fillna(1).astype(int)
         else:
-            X_w_anom = X_w_full; anom_filter_desc = "No RPM column"
+            wdf["anomaly"] = 1
 
-        method = anomaly_method_var.get(); contam = anomaly_contam_var.get() / 100.0
-        a_labels_sub, a_pct, a_idx_sub, a_name, a_scores_sub = \
-            detect_anomalies(X_w_anom, contamination=contam, method=method)
+        a_labels_rec = wdf["anomaly"].values
+        event_result = analyse_events(wdf, a_labels_rec)
 
-        a_labels = np.ones(len(wdf), dtype=int); a_scores = np.zeros(len(wdf))
-        if rpm_col_used and "RPM_Status" in wdf.columns and len(X_w_anom) < len(X_w_full):
-            sub_indices = np.where(wdf["RPM_Status"].isin(allowed).values)[0]
-            for li, gi in enumerate(sub_indices):
-                a_labels[gi] = a_labels_sub[li]; a_scores[gi] = a_scores_sub[li]
-            a_idx = [sub_indices[i] for i in a_idx_sub]
-        else:
-            a_labels = a_labels_sub; a_scores = a_scores_sub; a_idx = a_idx_sub
+        # Detailed per-well anomaly explanation
+        z_thr = 2.5
+        well_explanations = explain_anomalous_wells(
+            well_df_clean, num_agg_cols, cat_agg_cols,
+            a_labels_well, a_scores, well_id_col, z_threshold=z_thr)
 
-        wdf["anomaly"] = a_labels
-        anomaly_result = {
-            "labels": a_labels, "pct": a_pct, "indices": a_idx,
-            "scores": a_scores, "detector_name": f"{a_name}  [{anom_filter_desc}]",
-            "n_anomaly": len(a_idx), "n_normal": len(a_labels) - len(a_idx),
-        }
-        event_result = analyse_events(wdf, a_labels)
-
-        # ── 8. Per-parameter anomaly ───────────────────────────────────────────
-        z_thr = zthresh_var.get()
-        param_anom = analyse_per_parameter(wdf, use_cols_full, z_threshold=z_thr)
-
-        # ── 9. Parameter similarity ────────────────────────────────────────────
-        app.after(0, lambda: set_status("Computing parameter similarity…", WARN))
-        corr_matrix, cosine_matrix = compute_parameter_similarity(wdf, use_cols_full)
-
-        # ── Store globals ──────────────────────────────────────────────────────
         active_df             = wdf
-        active_X              = X_w_full
-        active_xcols          = use_cols_full
+        active_X              = X_anom
+        active_xcols          = num_sel
         active_well_df        = well_df_clean
-        active_anomaly_result = anomaly_result
-        active_weight_result  = {"weight_map": weight_map, "method_desc": method_desc}
+        active_anomaly_result = {
+            "labels": a_labels_well, "pct": a_pct, "indices": a_idx,
+            "scores": a_scores,
+            "detector_name": f"{a_name}  [well-profile detection]",
+            "n_anomaly": int((a_labels_well == -1).sum()),
+            "n_normal":  int((a_labels_well ==  1).sum()),
+            "explanations": well_explanations,
+        }
         active_event_result   = event_result
-        active_rpm_result     = rpm_result
-        active_param_anom     = param_anom
 
-        hx     = cluster_hex(n_clusters)
-        y_cols = [c for c in wdf.select_dtypes(include="number").columns
-                  if c not in use_cols_full and c != "cluster"][:2]
-
-        insights = generate_insights(wdf, use_cols_full, n_rows, n_unique_wells, hx,
-                                     anomaly_result, event_result, weight_map, method_desc,
-                                     inertia, rpm_result, param_anom,
-                                     corr_matrix, n_wells, well_id_col)
+        hx = cluster_hex(n_clusters)
+        insights = _generate_insights(
+            wdf, well_df_clean, num_sel, selected_cols, n_rows, n_unique_wells,
+            n_wells, hx, active_anomaly_result, event_result, weight_map,
+            inertia, event_result, well_id_col,
+            cluster_method, cat_sel, well_explanations)
+        active_insights_text = insights
 
         app.after(0, lambda: refresh_ui(
-            wdf, well_df_clean, X_well, use_cols_full, mean_cols, y_cols, hx, insights,
-            n_rows, n_unique_wells, anomaly_result, event_result,
-            weight_map, method_desc, rpm_result, param_anom,
-            corr_matrix, cosine_matrix))
-        app.after(0, lambda: set_status("✔  Analysis complete", SUCCESS))
+            wdf, well_df_clean, X_anom,
+            num_agg_cols + cat_agg_cols, num_sel,
+            hx, insights, n_rows, n_unique_wells,
+            active_anomaly_result, event_result, cluster_method))
+        app.after(0, lambda: set_status(
+            f"✔  Analysis complete  [{cluster_method}]", SUCCESS))
         app.after(0, progress_stop)
         app.after(0, lambda: export_btn.config(state="normal"))
 
@@ -1734,111 +1371,50 @@ def run_pipeline():
         app.after(0, progress_stop)
 
 
-def refresh_ui(wdf, well_df, X_well, x_cols, mean_cols, y_cols, hx, insights,
-               n_rows, n_unique_wells, anomaly_result, event_result,
-               weight_map, method_desc, rpm_result, param_anom,
-               corr_matrix, cosine_matrix):
-
-    # Use well_df for cluster plots (one point per well)
-    well_x = [c.replace("__mean", "") for c in mean_cols[:2]]
-    well_y = [c.replace("__mean", "") for c in mean_cols[2:4]]
+def refresh_ui(wdf, well_df, X_anom, agg_cols, num_cols,
+               hx, insights, n_rows, n_unique_wells,
+               anomaly_result, event_result, cluster_method):
 
     draw_plot(cluster_tab,
-              _plot_well_clusters(well_df, mean_cols, hx), "clusters",
+              plot_well_clusters(well_df, agg_cols, hx, cluster_method), "clusters",
               legend_builder=build_cluster_legend,
-              legend_kwargs={"df": well_df, "hex_colors": hx})
+              legend_kwargs={"df": well_df, "hex_colors": hx, "cluster_method": cluster_method})
     draw_plot(pca_tab,
-              plot_pca(X_well, well_df["cluster"].values, hx), "pca",
+              plot_pca(X_anom, well_df["cluster"].values, hx, cluster_method), "pca",
               legend_builder=build_cluster_legend,
-              legend_kwargs={"df": well_df, "hex_colors": hx})
-    draw_plot(reservoir_tab,
-              plot_reservoir_3d(well_df, mean_cols[:3], [], hx), "reservoir_3d",
-              legend_builder=build_cluster_legend,
-              legend_kwargs={"df": well_df, "hex_colors": hx})
-    draw_plot(production_tab,
-              plot_production(wdf, y_cols, x_cols, hx), "production",
-              legend_builder=build_cluster_legend,
-              legend_kwargs={"df": wdf, "hex_colors": hx})
+              legend_kwargs={"df": well_df, "hex_colors": hx, "cluster_method": cluster_method})
     draw_plot(hidden_tab,
-              plot_hidden_patterns(X_well, well_df["cluster"].values, mean_cols,
-                                   anomaly_result["detector_name"]), "hidden_patterns",
+              plot_hidden_patterns(X_anom, well_df["anomaly"].values,
+                                   agg_cols, anomaly_result["detector_name"]),
+              "hidden_patterns",
               legend_builder=build_anomaly_legend,
               legend_kwargs={"n_normal": anomaly_result["n_normal"],
                              "n_anomaly": anomaly_result["n_anomaly"]})
-    draw_plot(weight_tab, plot_weight_chart(weight_map, method_desc), "param_weights",
-              legend_builder=build_weight_legend,
-              legend_kwargs={"weight_map": weight_map, "method_desc": method_desc})
-    draw_plot(event_tab, plot_event_chart(wdf, event_result), "event_summary",
+    draw_plot(event_tab,
+              plot_event_chart(wdf, event_result), "event_summary",
               legend_builder=build_event_legend,
               legend_kwargs={"event_result": event_result})
-    draw_plot(rpm_tab, plot_rpm_chart(wdf, rpm_result), "rpm_status",
-              legend_builder=build_rpm_legend,
-              legend_kwargs={"rpm_result": rpm_result})
-    draw_plot(param_anom_tab,
-              plot_param_anomaly(param_anom, df=wdf, anomaly_labels=anomaly_result["labels"]),
-              "param_anomaly",
-              legend_builder=build_param_anomaly_legend,
-              legend_kwargs={"param_anom_list": param_anom})
-    # ★ NEW — Similarity tab
-    draw_plot(similarity_tab,
-              plot_similarity(corr_matrix, cosine_matrix), "similarity",
-              legend_builder=build_similarity_legend,
-              legend_kwargs={"corr_matrix": corr_matrix})
 
-    # Stat tiles
     stat_widgets["Unique Wells"].set(f"{n_unique_wells:,}")
     stat_widgets["Total Records"].set(f"{n_rows:,}")
     stat_widgets["Clusters"].set(str(well_df["cluster"].nunique()))
-    anom_n = anomaly_result["n_anomaly"]; anom_p = anomaly_result["pct"]
-    stat_widgets["Anomaly Recs"].set(f"{anom_n:,}\n({anom_p:.1f}%)")
+    an = anomaly_result["n_anomaly"]; ap = anomaly_result["pct"]
+    stat_widgets["Anomaly Wells"].set(f"{an:,}\n({ap:.1f}%)")
     if event_result["has_events"]:
         stat_widgets["Active Recs"].set(f"{event_result['n_active']:,}")
         stat_widgets["Inactive Recs"].set(f"{event_result['n_inactive']:,}")
         stat_widgets["Event Types"].set(str(len(event_result["event_counts"])))
     else:
-        stat_widgets["Active Recs"].set("N/A"); stat_widgets["Inactive Recs"].set("N/A")
+        stat_widgets["Active Recs"].set("N/A")
+        stat_widgets["Inactive Recs"].set("N/A")
         stat_widgets["Event Types"].set("N/A")
     stat_widgets["Abnormal Recs"].set(f"{event_result['n_abnormal']:,}")
-    if rpm_result["found"]:
-        stat_widgets["RPM Running"].set(f"{rpm_result['running']:,}")
-        stat_widgets["RPM Stopped"].set(f"{rpm_result['stopped']:,}")
-        stat_widgets["RPM Reverse"].set(f"{rpm_result['reverse']:,}")
-    else:
-        stat_widgets["RPM Running"].set("N/A"); stat_widgets["RPM Stopped"].set("N/A")
-        stat_widgets["RPM Reverse"].set("N/A")
-    flagged = sum(1 for r in param_anom if r["n_anom"] > 0)
-    stat_widgets["Param Anomalies"].set(f"{flagged}/{len(param_anom)}\nparams flagged")
 
     update_event_panel(event_result)
     explain_text.config(state="normal")
-    explain_text.delete("1.0", "end")
+    explain_text.delete("1.0","end")
     explain_text.insert("end", insights)
     explain_text.config(state="disabled")
-
-
-def _plot_well_clusters(well_df, mean_cols, hex_colors):
-    """Scatter plot: one point per well, coloured by cluster."""
-    fig, ax = plt.subplots(figsize=(7.5, 4.5)); _style_ax(ax)
-    x_col = mean_cols[0] if len(mean_cols) > 0 else None
-    y_col = mean_cols[1] if len(mean_cols) > 1 else None
-    if x_col and y_col and x_col in well_df.columns and y_col in well_df.columns:
-        for cl in sorted(well_df["cluster"].unique()):
-            mask = well_df["cluster"] == cl; col = hex_colors[int(cl) % len(hex_colors)]
-            ax.scatter(well_df.loc[mask, x_col], well_df.loc[mask, y_col],
-                       color=col, s=80, edgecolors="#ffffff44", linewidths=0.7, zorder=3,
-                       label=f"Cluster {cl}  ({int(mask.sum()):,} wells)")
-        xlabel = x_col.replace("__mean", "")
-        ylabel = y_col.replace("__mean", "")
-        ax.set_xlabel(f"{xlabel}  (mean per well)", fontsize=9)
-        ax.set_ylabel(f"{ylabel}  (mean per well)", fontsize=9)
-    else:
-        ax.text(0.2, 0.5, "Not enough features for scatter plot",
-                transform=ax.transAxes, color=FG_DIM, fontsize=10)
-    ax.set_title("Well Clusters  (one point = one well)",
-                 color=COL_CLUSTER, fontsize=13, pad=12, fontweight="bold")
-    ax.legend(loc="upper left", fontsize=8.5, framealpha=0.92,
-              edgecolor="#334155", facecolor="#161d2e", labelcolor="#e2e8f0", markerscale=1.4)
-    return fig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1852,62 +1428,58 @@ def update_event_panel(event_result):
         ev_abnormal_var.set("N/A"); ev_op_anom_var.set("N/A"); return
     ev_status_var.set(f"Column: '{event_result['event_col']}'"); ev_status_lbl.config(fg=SUCCESS2)
     counts = event_result["event_counts"]
-    top = sorted(counts.items(), key=lambda x: -x[1])[:6]
-    keys = list(ev_count_vars.keys())
+    top = sorted(counts.items(), key=lambda x: -x[1])[:6]; keys = list(ev_count_vars.keys())
     for i, k in enumerate(keys):
         if i < len(top):
-            label, cnt = top[i]; ev_count_vars[k].set(f"{cnt:,}")
-            ev_count_lbls[k].config(text=label[:24])
+            label, cnt = top[i]; ev_count_vars[k].set(f"{cnt:,}"); ev_count_lbls[k].config(text=label[:24])
         else:
             ev_count_vars[k].set("—"); ev_count_lbls[k].config(text="—")
-    ev_active_var.set(f"{event_result['n_active']:,}")
-    ev_inactive_var.set(f"{event_result['n_inactive']:,}")
-    ev_abnormal_var.set(f"{event_result['n_abnormal']:,}")
-    ev_op_anom_var.set(f"{len(event_result.get('operational_anomalies', [])):,}")
+    ev_active_var.set(f"{event_result['n_active']:,}"); ev_inactive_var.set(f"{event_result['n_inactive']:,}")
+    ev_abnormal_var.set(f"{event_result['n_abnormal']:,}"); ev_op_anom_var.set("N/A")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
 def export_results():
-    if active_df is None:
-        messagebox.showwarning("Export", "Run analysis first."); return
+    if active_df is None: messagebox.showwarning("Export","Run analysis first."); return
     path = filedialog.asksaveasfilename(
         defaultextension=".xlsx", initialfile=f"cbm_results_{ts()}.xlsx",
-        filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
+        filetypes=[("Excel","*.xlsx"),("CSV","*.csv")])
     if not path: return
     try:
-        import pandas as pd
-        ext = os.path.splitext(path)[1].lower()
+        import pandas as pd; ext = os.path.splitext(path)[1].lower()
         if ext == ".xlsx":
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
                 active_df.to_excel(writer, sheet_name="All Records", index=False)
                 if active_well_df is not None:
                     active_well_df.to_excel(writer, sheet_name="Well Profiles", index=False)
-                if "anomaly" in active_df.columns:
-                    active_df[active_df["anomaly"] == -1].to_excel(
-                        writer, sheet_name="Anomaly Records", index=False)
-                active_df.groupby("cluster").size().reset_index(name="well_count").to_excel(
+                if active_well_df is not None and "anomaly" in active_well_df.columns:
+                    active_well_df[active_well_df["anomaly"] == -1].to_excel(
+                        writer, sheet_name="Anomaly Wells", index=False)
+                active_well_df.groupby("cluster").size().reset_index(name="well_count").to_excel(
                     writer, sheet_name="Cluster Summary", index=False)
-                if active_weight_result:
-                    wm = active_weight_result["weight_map"]
-                    pd.DataFrame([{"Parameter": k, "Weight_%": v}
-                                  for k, v in sorted(wm.items(), key=lambda x: -x[1])
-                                  ]).to_excel(writer, sheet_name="Parameter Weights", index=False)
-                if active_param_anom:
-                    pa_rows = [{"Parameter": r["col"], "Total_Rows": r["n_total"],
-                                "Outliers": r["n_anom"], "Outlier_%": round(r["pct"], 2),
-                                "Mean": round(r["mean"], 4), "StdDev": round(r["std"], 4),
-                                "Severity": r["severity"], "Reason": r["reason"]}
-                               for r in active_param_anom]
-                    pd.DataFrame(pa_rows).to_excel(writer, sheet_name="Parameter Anomalies", index=False)
-                report_txt = explain_text.get("1.0", "end").strip()
+                if active_anomaly_result and active_anomaly_result.get("explanations"):
+                    expl_rows = []
+                    for e in active_anomaly_result["explanations"]:
+                        for p in e["flagged_params"]:
+                            expl_rows.append({
+                                "Well": e["well"],
+                                "Anomaly_Score": e["anomaly_score"],
+                                "Parameter": p["param"],
+                                "Value": p["value"],
+                                "Z_Score": p.get("z_score",""),
+                                "Direction": p["direction"],
+                                "Reason": p["reason"]
+                            })
+                    if expl_rows:
+                        pd.DataFrame(expl_rows).to_excel(
+                            writer, sheet_name="Anomaly Explanations", index=False)
+                report_txt = explain_text.get("1.0","end").strip()
                 pd.DataFrame({"Report": report_txt.split("\n")}).to_excel(
                     writer, sheet_name="Insights Report", index=False)
             set_status(f"✔  Exported: {os.path.basename(path)}", SUCCESS)
-            messagebox.showinfo("Export Complete", f"Saved: {path}\n\nSheets: All Records, Well Profiles, "
-                                "Anomaly Records, Cluster Summary, Parameter Weights, "
-                                "Parameter Anomalies, Insights Report")
+            messagebox.showinfo("Export Complete", f"Saved: {path}")
         else:
             _save_df(active_df, path); set_status(f"✔  Exported: {os.path.basename(path)}", SUCCESS)
     except Exception as e:
@@ -1915,118 +1487,257 @@ def export_results():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INSIGHTS REPORT
+# ENHANCED INSIGHTS REPORT
 # ══════════════════════════════════════════════════════════════════════════════
-def generate_insights(df, x_cols, n_rows, n_unique_wells, hx, anomaly_result,
-                      event_result, weight_map, method_desc, inertia,
-                      rpm_result=None, param_anom=None,
-                      corr_matrix=None, n_wells=None, well_id_col=None):
+def _generate_insights(wdf, well_df, num_cols, selected_cols, n_rows, n_unique_wells,
+                       n_wells, hx, anomaly_result, event_result, weight_map,
+                       inertia, rpm_result, well_id_col,
+                       cluster_method="", cat_sel=None, well_explanations=None):
     import textwrap
-    W = "=" * 56; D = "-" * 56; B = ""
-    n_anom = anomaly_result["n_anomaly"]; a_pct = anomaly_result["pct"]
-    sev_label = ("LOW" if a_pct < 2 else "MODERATE" if a_pct < 8 else
-                 "ELEVATED" if a_pct < 20 else "HIGH")
+    W="="*60; D="-"*60; B=""
+    n_anom=anomaly_result["n_anomaly"]; a_pct=anomaly_result["pct"]
+    sev_label=("LOW" if a_pct<2 else "MODERATE" if a_pct<8 else "ELEVATED" if a_pct<20 else "HIGH")
+    cat_cols = cat_sel or []
+    lines=[W,"  CBM AI ANALYSIS REPORT   v7.0",
+           f"  Generated : {datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",W,B,
+           "  DATASET SUMMARY","  "+D,
+           f"  Unique wells       : {n_unique_wells:,}",
+           f"  Well profiles      : {n_wells:,}  (clustered)",
+           f"  Total records      : {n_rows:,}",
+           f"  Well ID column     : {well_id_col or 'Not detected'}",
+           f"  Selected features  : {len(selected_cols)}",
+           f"    Numeric          : {len(num_cols)}  →  {', '.join(num_cols)}",
+           f"    Categorical      : {len(cat_cols)}  →  {', '.join(cat_cols) if cat_cols else 'none'}",
+           f"  Clusters           : {well_df['cluster'].nunique() if 'cluster' in well_df.columns else '—'}",
+           f"  Cluster algorithm  : {cluster_method}",
+           f"  Inertia/cost proxy : {inertia:.4f}",B]
 
-    lines = [W, "  CBM AI ANALYSIS REPORT   v6.0",
-             f"  Generated : {datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
-             W, B,
-             "  DATASET SUMMARY", "  " + D,
-             f"  Unique wells   : {n_unique_wells:,}",
-             f"  Well profiles  : {n_wells or n_unique_wells:,}  (clustered)",
-             f"  Total records  : {n_rows:,}",
-             f"  Well ID column : {well_id_col or 'Not detected'}",
-             f"  Clusters       : {df['cluster'].nunique() if 'cluster' in df.columns else '—'}",
-             f"  Features used  : {len(x_cols)}",
-             f"  Feature list   : {', '.join(x_cols)}",
-             f"  KMeans inertia : {inertia:.2f}", B]
+    lines+=[W,"  ANOMALY DETECTION  (well-level)","  "+D,
+            f"  Algorithm          : {anomaly_result['detector_name']}",
+            f"  Normal wells       : {anomaly_result['n_normal']:,}",
+            f"  Anomalous wells    : {n_anom:,}  ({a_pct:.1f}%)",
+            f"  Overall Severity   : {sev_label}",B]
 
-    lines += [W, "  WELL-BASED CLUSTERING", "  " + D,
-              "  Each cluster = a group of wells with similar production profiles.",
-              "  Clustering is done on per-well mean statistics (not raw records).",
-              "  This makes clustering meaningful and fast even on 300k+ record datasets.", B]
-
-    # Weights
-    lines += [W, "  PARAMETER WEIGHTS", "  " + D, f"  Method : {method_desc}", B]
-    if weight_map:
-        max_w = max(weight_map.values())
-        lines.append(f"  {'PARAMETER':<28}  {'WEIGHT':>7}")
-        lines.append("  " + D)
-        for param, wt in sorted(weight_map.items(), key=lambda x: -x[1]):
-            star = "  <- HIGHEST" if wt == max_w else ""
-            lines.append(f"  {param:<28}  {wt:>6.1f}%{star}")
-    lines.append(B)
-
-    # Correlation summary
-    if corr_matrix is not None:
-        lines += [W, "  PARAMETER SIMILARITY (Pearson Correlation)", "  " + D]
-        cols = list(corr_matrix.columns)
-        pairs = []
-        for i, c1 in enumerate(cols):
-            for j, c2 in enumerate(cols):
-                if j <= i: continue
-                pairs.append((abs(corr_matrix.loc[c1, c2]), c1, c2, corr_matrix.loc[c1, c2]))
-        pairs.sort(reverse=True)
-        lines.append(f"  {'PAIR':<40}  {'CORR':>7}  INTERPRETATION")
-        lines.append("  " + D)
-        for abs_r, c1, c2, r in pairs[:10]:
-            interp = ("HIGHLY similar" if abs_r > 0.8 else
-                      "Moderately similar" if abs_r > 0.5 else
-                      "Weakly similar" if abs_r > 0.3 else "Independent")
-            pair_str = f"{c1[:18]} ⟺ {c2[:18]}"
-            lines.append(f"  {pair_str:<40}  {r:>7.3f}  {interp}")
-        lines.append(B)
-
-    # Anomaly summary
-    lines += [W, "  OVERALL ANOMALY DETECTION", "  " + D,
-              f"  Algorithm      : {anomaly_result['detector_name']}",
-              f"  Normal records : {anomaly_result['n_normal']:,}",
-              f"  Anomalous recs : {n_anom:,}  ({a_pct:.1f}%)",
-              f"  Severity level : {sev_label}", B]
-
-    # Per-parameter
-    lines += [W, "  PER-PARAMETER ANOMALY ANALYSIS", "  " + D]
-    if param_anom:
-        flagged = [r for r in param_anom if r["n_anom"] > 0]
-        clean   = [r for r in param_anom if r["n_anom"] == 0]
-        lines += [f"  Parameters checked : {len(param_anom)}",
-                  f"  Parameters flagged : {len(flagged)}",
-                  f"  Parameters clean   : {len(clean)}", B]
-        for idx, r in enumerate(flagged, 1):
-            lines += [f"  [{idx}] {r['col']}  —  Severity: {r['severity']}",
-                      f"      Anomalous: {r['n_anom']:,}  ({r['pct']:.2f}%)  "
-                      f"|  Normal: {r['n_total']-r['n_anom']:,}",
-                      f"      Mean={r['mean']:.4f}  Std={r['std']:.4f}  "
-                      f"Skew={r['skew']:.3f}"]
-            for wl in textwrap.wrap(r["reason"], 54):
-                lines.append(f"      {wl}")
-            lines += [B]
+    # ── DETAILED HIDDEN PATTERN EXPLANATIONS ──────────────────────────────────
+    lines += [W, "  HIDDEN PATTERN ANALYSIS  —  WHY EACH WELL IS ANOMALOUS", "  "+D]
+    if not well_explanations:
+        lines += ["  No anomalous wells detected.", B]
     else:
-        lines += ["  Per-parameter analysis not available.", B]
+        lines += [
+            f"  Total anomalous wells: {len(well_explanations)}",
+            f"  Detection method: {anomaly_result['detector_name']}",
+            f"  Z-score threshold for parameter flagging: 2.5σ",
+            B
+        ]
+        for rank, expl in enumerate(well_explanations, 1):
+            lines += [
+                f"  ┌─ ANOMALY #{rank} ─────────────────────────────────────────",
+                f"  │  Well ID       : {expl['well']}",
+                f"  │  Anomaly Score : {expl['anomaly_score']:.5f}  "
+                f"(more negative = more anomalous)",
+                f"  │  Flagged Params: {expl['n_flagged']}",
+            ]
+            if not expl["flagged_params"]:
+                lines += [
+                    "  │  Note: This well is anomalous in the combined",
+                    "  │        multi-dimensional feature space but no",
+                    "  │        single parameter exceeds the 2.5σ threshold.",
+                    "  │        Check the PCA / Hidden Patterns plot for",
+                    "  │        visual isolation from the normal cluster.",
+                ]
+            else:
+                for pi, p in enumerate(expl["flagged_params"], 1):
+                    z_str = f"  z={p['z_score']:+.2f}σ" if p.get("z_score") is not None else ""
+                    dir_str = f"  [{p['direction']}]"
+                    lines += [
+                        f"  │",
+                        f"  │  Parameter {pi}: {p['param']}",
+                        f"  │    Value    : {p['value']}{z_str}{dir_str}",
+                    ]
+                    if p.get("mean") is not None:
+                        lines += [
+                            f"  │    Fleet avg: {p['mean']:.4f}  ±{p['std']:.4f}",
+                            f"  │    P10–P90  : {p['p10']:.4f} – {p['p90']:.4f}",
+                        ]
+                    reason_lines = textwrap.wrap(p["reason"], 52)
+                    for i, rl in enumerate(reason_lines):
+                        lines.append(f"  │    {'WHY: ' if i==0 else '      '}{rl}")
+            lines += ["  └" + "─"*54, B]
 
-    # Events
-    lines += [W, "  OPERATIONAL EVENTS", "  " + D]
+    # ── CLUSTER SUMMARY ───────────────────────────────────────────────────────
+    if "cluster" in well_df.columns:
+        lines += [W, "  CLUSTER SUMMARY", "  "+D]
+        for cl in sorted(well_df["cluster"].unique()):
+            grp = well_df[well_df["cluster"] == cl]
+            n_cl = len(grp)
+            anom_in_cl = int((grp["anomaly"] == -1).sum()) if "anomaly" in grp.columns else 0
+            lines += [
+                f"  Cluster {cl}:  {n_cl:,} wells  |  {anom_in_cl} anomalous "
+                f"({anom_in_cl/max(n_cl,1)*100:.1f}%)"
+            ]
+            # Show mean of top numeric cols per cluster
+            import pandas as pd
+            top_cols = [c for c in num_cols if f"{c}__mean" in grp.columns][:4]
+            for c in top_cols:
+                vals = grp[f"{c}__mean"].dropna()
+                if len(vals):
+                    lines.append(f"    {c[:28]:<28} mean={float(vals.mean()):.4f}")
+            lines.append(B)
+
     if event_result["has_events"]:
-        lines += [f"  Column: {event_result['event_col']}",
-                  f"  Active: {event_result['n_active']:,}  |  Inactive: {event_result['n_inactive']:,}", B]
-        for ev, cnt in sorted(event_result["event_counts"].items(), key=lambda x: -x[1]):
-            pct = cnt / max(n_rows, 1) * 100
-            lines.append(f"  {ev:<30}  {cnt:>6,}  {pct:>5.1f}%")
-    else:
-        lines += [f"  {event_result['message']}"]
-    lines.append(B)
+        lines += [W, "  EVENT SUMMARY", "  "+D,
+                  f"  Event column: '{event_result['event_col']}'",
+                  f"  Active records  : {event_result['n_active']:,}",
+                  f"  Inactive records: {event_result['n_inactive']:,}",
+                  f"  Abnormal records: {event_result['n_abnormal']:,}",B]
 
-    # RPM
-    if rpm_result and rpm_result.get("found"):
-        total_rpm = max(rpm_result["running"] + rpm_result["stopped"] +
-                        rpm_result["reverse"] + rpm_result["no_data"], 1)
-        lines += [W, "  RPM STATUS", "  " + D,
-                  f"  Running : {rpm_result['running']:,}  ({rpm_result['running']/total_rpm*100:.1f}%)",
-                  f"  Stopped : {rpm_result['stopped']:,}  ({rpm_result['stopped']/total_rpm*100:.1f}%)",
-                  f"  Reverse : {rpm_result['reverse']:,}  ({rpm_result['reverse']/total_rpm*100:.1f}%)",
-                  B]
-
-    lines += [W, "  END OF REPORT", W]
+    lines += [W, "  END OF REPORT  v7.0", W]
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI CHATBOT
+# ══════════════════════════════════════════════════════════════════════════════
+CHATBOT_SYSTEM = """You are an expert AI assistant embedded inside the CBM AI Analytics Platform v7.0,
+a Coalbed Methane (CBM) well analytics desktop application built in Python/Tkinter.
+
+You help the user understand:
+1. HOW THE APP WORKS — features, tabs, controls, pipeline steps
+2. ANALYSIS RESULTS — clusters, anomalies, events, hidden patterns
+3. CBM DOMAIN KNOWLEDGE — coalbed methane production, well health, common failure modes
+4. DATA INTERPRETATION — what anomaly scores mean, how clustering works, etc.
+5. TROUBLESHOOTING — why something might not work, what data formats are needed
+
+Key app facts:
+- Tabs: Well Clusters, PCA, Hidden Patterns, Events (Parameter Weights/RPM/Param Anomaly/Similarity were removed in v7.0)
+- Clustering algorithm chain: KPrototypes → KModes → Gower/Agglomerative → Ward → KMeans
+- Anomaly detection: Isolation Forest or Local Outlier Factor on well profiles
+- Data: aggregates raw records per well (mean/std/min/max for numeric, mode for categorical)
+- Export: Excel with sheets — All Records, Well Profiles, Anomaly Wells, Cluster Summary, Anomaly Explanations, Insights Report
+- The Insights Report shows per-well anomaly explanations with z-scores and parameter-level reasoning
+
+If the user provides analysis results context (appended below), use it to give specific answers.
+Be concise but thorough. Use plain English. Format with bullet points when listing multiple items.
+"""
+
+def _build_context_for_chatbot():
+    """Build a short context string from current analysis state."""
+    parts = []
+    if raw_data is not None:
+        parts.append(f"Dataset loaded: {len(raw_data):,} rows × {len(raw_data.columns)} columns.")
+    if active_well_df is not None:
+        n_wells = len(active_well_df)
+        n_anom = int((active_well_df.get("anomaly", 0) == -1).sum()) if "anomaly" in active_well_df.columns else 0
+        n_cl = active_well_df["cluster"].nunique() if "cluster" in active_well_df.columns else 0
+        parts.append(f"Analysis complete: {n_wells} well profiles, {n_cl} clusters, {n_anom} anomalous wells.")
+        parts.append(f"Cluster algorithm: {active_cluster_method}")
+    if active_anomaly_result:
+        parts.append(f"Anomaly detector: {active_anomaly_result['detector_name']}")
+        parts.append(f"Anomaly rate: {active_anomaly_result['pct']:.1f}%")
+    if active_insights_text and len(active_insights_text) > 50:
+        # Provide the full insights report to chatbot
+        parts.append("\n\nFULL INSIGHTS REPORT:\n" + active_insights_text[:6000])
+    return "\n".join(parts)
+
+def send_chat_message():
+    user_msg = chat_input.get("1.0", "end").strip()
+    if not user_msg:
+        return
+    chat_input.delete("1.0", "end")
+    _append_chat("You", user_msg, "#60a5fa")
+    threading.Thread(target=_call_claude_api, args=(user_msg,), daemon=True).start()
+
+def _append_chat(sender, message, color):
+    def _do():
+        chat_display.config(state="normal")
+        chat_display.insert("end", f"\n{sender}:\n", f"sender_{color.lstrip('#')}")
+        chat_display.insert("end", f"{message}\n")
+        chat_display.tag_configure(f"sender_{color.lstrip('#')}",
+                                   foreground=color, font=FONT_H3)
+        chat_display.see("end")
+        chat_display.config(state="disabled")
+    app.after(0, _do)
+
+def _call_claude_api(user_msg):
+    global chatbot_history
+    _append_chat("CBM·AI", "Thinking…", COL_CHATBOT)
+
+    context = _build_context_for_chatbot()
+    system_msg = CHATBOT_SYSTEM
+    if context:
+        system_msg += f"\n\nCURRENT ANALYSIS CONTEXT:\n{context}"
+
+    chatbot_history.append({"role": "user", "content": user_msg})
+    # Keep last 20 turns
+    history_trimmed = chatbot_history[-20:]
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1000,
+        "system": system_msg,
+        "messages": history_trimmed
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": ""   # API key handled by proxy
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            reply = "".join(
+                block.get("text", "") for block in data.get("content", [])
+                if block.get("type") == "text"
+            ).strip()
+            if not reply:
+                reply = "(No response from model)"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        reply = f"API Error {e.code}: {body[:300]}"
+    except Exception as e:
+        reply = f"Connection error: {e}\n\nMake sure you have internet access and a valid API key."
+
+    chatbot_history.append({"role": "assistant", "content": reply})
+
+    # Remove "Thinking…" and add real reply
+    def _update():
+        chat_display.config(state="normal")
+        content = chat_display.get("1.0", "end")
+        thinking_tag = "\nCBM·AI:\nThinking…\n"
+        if thinking_tag in content:
+            idx = content.rfind(thinking_tag)
+            start = f"1.0 + {idx} chars"
+            end   = f"1.0 + {idx + len(thinking_tag)} chars"
+            chat_display.delete(start, end)
+        chat_display.insert("end", f"\nCBM·AI:\n", "sender_e879f9")
+        chat_display.insert("end", f"{reply}\n")
+        chat_display.tag_configure("sender_e879f9", foreground=COL_CHATBOT, font=FONT_H3)
+        chat_display.see("end")
+        chat_display.config(state="disabled")
+    app.after(0, _update)
+
+
+def clear_chat():
+    global chatbot_history
+    chatbot_history = []
+    chat_display.config(state="normal")
+    chat_display.delete("1.0", "end")
+    chat_display.insert("end",
+        "CBM·AI Assistant ready.\n"
+        "Ask me anything about the app, your data, or the analysis results.\n"
+        "Examples:\n"
+        "  • Why is well X anomalous?\n"
+        "  • What does the cluster analysis tell me?\n"
+        "  • How does Isolation Forest work?\n"
+        "  • What file formats are supported?\n"
+    )
+    chat_display.config(state="disabled")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2037,476 +1748,337 @@ if HAVE_TTKBS:
 else:
     app = tk.Tk(); app.configure(bg=BG_DEEP)
 
-app.title("CBM AI Analytics Platform  v6.0  —  Well Clustering + Feature Selection + Similarity")
-app.geometry("1780x1000")
-app.configure(bg=BG_DEEP); app.minsize(1280, 720)
+app.title("CBM AI Analytics Platform  v7.0  —  Well Clustering · Anomaly Detection · AI Chatbot")
+app.geometry("1820x1020"); app.configure(bg=BG_DEEP); app.minsize(1280,720)
 
-top_bar = tk.Frame(app, bg="#040810", height=46)
-top_bar.pack(fill="x", side="top"); top_bar.pack_propagate(False)
-brand = tk.Frame(top_bar, bg="#040810"); brand.pack(side="left", padx=16, fill="y")
-tk.Label(brand, text="CBM·AI", bg="#040810", fg=COL_DATASET,
-         font=("Georgia", 17, "bold")).pack(side="left", padx=(0, 10))
-tk.Label(brand, text="Coalbed Methane Analytics  v6.0  —  Well Clustering + Feature Selection + Similarity",
-         bg="#040810", fg=FG_DIM, font=FONT_SM).pack(side="left")
+top_bar=tk.Frame(app,bg="#040810",height=46)
+top_bar.pack(fill="x",side="top"); top_bar.pack_propagate(False)
+brand=tk.Frame(top_bar,bg="#040810"); brand.pack(side="left",padx=16,fill="y")
+tk.Label(brand,text="CBM·AI",bg="#040810",fg=COL_DATASET,font=("Georgia",17,"bold")).pack(side="left",padx=(0,10))
+tk.Label(brand,text="Coalbed Methane Analytics  v7.0  —  Clustering · Hidden Patterns · AI Chatbot",
+         bg="#040810",fg=FG_DIM,font=FONT_SM).pack(side="left")
 tk.Label(top_bar,
-         text="Huge files: chunked load  ·  Well-based clusters  ·  Param similarity  ·  Feature selector",
-         bg="#040810", fg=FG_DIM, font=FONT_XS).pack(side="right", padx=14)
-tk.Frame(app, bg=BORDER, height=1).pack(fill="x")
+         text="KPrototypes · Gower · Ward · KMeans  ·  Isolation Forest / LOF  ·  Claude-powered Chatbot",
+         bg="#040810",fg=FG_DIM,font=FONT_XS).pack(side="right",padx=14)
+tk.Frame(app,bg=BORDER,height=1).pack(fill="x")
 
-root_pane = tk.PanedWindow(app, orient="horizontal", bg=BG_DEEP,
-                           sashwidth=4, sashrelief="flat", sashpad=0)
-root_pane.pack(fill="both", expand=True)
+root_pane=tk.PanedWindow(app,orient="horizontal",bg=BG_DEEP,sashwidth=4,sashrelief="flat",sashpad=0)
+root_pane.pack(fill="both",expand=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LEFT SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
-sb_outer, sidebar = make_scrollable(root_pane, bg=SIDEBAR)
-root_pane.add(sb_outer, width=460, minsize=420)
-tk.Frame(sidebar, bg=SIDEBAR, height=8).pack()
+sb_outer,sidebar=make_scrollable(root_pane,bg=SIDEBAR)
+root_pane.add(sb_outer,width=440,minsize=400)
+tk.Frame(sidebar,bg=SIDEBAR,height=8).pack()
 
 # ① DATASET
-ds_body = make_section_card(sidebar, "① DATASET  (chunked load — any size)", COL_DATASET)
-tk.Label(ds_body,
-         text="Accepts: CSV, TSV, XLSX, XLS, ODS, JSON, Parquet,\n"
-              "Feather, HDF5, Pickle, MS Access .mdb/.accdb\n"
-              "Large CSVs are streamed in chunks — no memory crash.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420, justify="left").pack(anchor="w", pady=(0, 4))
-make_btn(ds_body, "  Upload Data File", upload_dataset, color="#0e7490", fg_col="#e0f7fa",
-         tip="Load any data file")
-info_row = tk.Frame(ds_body, bg=CARD); info_row.pack(fill="x", pady=(6, 0))
-rows_var = tk.StringVar(value="—"); cols_var = tk.StringVar(value="—")
-num_cols_var = tk.StringVar(value="—")
-for title, var, col in [("Unique Wells", rows_var, COL_DATASET),
-                         ("Columns", cols_var, FG_DIM),
-                         ("Numeric", num_cols_var, COL_WEIGHTS)]:
-    cf = tk.Frame(info_row, bg=CARD); cf.pack(side="left", expand=True, fill="x")
-    tk.Label(cf, text=title, bg=CARD, fg=FG_DIM, font=FONT_XS).pack(anchor="w")
-    tk.Label(cf, textvariable=var, bg=CARD, fg=col,
-             font=("Courier New", 13, "bold")).pack(anchor="w")
-event_col_var = tk.StringVar(value="Upload dataset to detect event column")
-event_col_lbl = tk.Label(ds_body, textvariable=event_col_var, bg=CARD, fg=FG_DIM,
-                         font=FONT_XS, wraplength=420, justify="left", anchor="w")
-event_col_lbl.pack(fill="x", pady=(4, 0))
-well_id_var = tk.StringVar(value="Well ID column: Not detected yet")
-well_id_lbl = tk.Label(ds_body, textvariable=well_id_var, bg=CARD, fg=FG_DIM,
-                       font=FONT_XS, wraplength=420, justify="left", anchor="w")
-well_id_lbl.pack(fill="x", pady=(2, 0))
+ds_body=make_section_card(sidebar,"① DATASET",COL_DATASET)
+tk.Label(ds_body,text="CSV, TSV, XLSX, XLS, ODS, JSON, Parquet, HDF5, Pickle, MS Access .mdb/.accdb",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420,justify="left").pack(anchor="w",pady=(0,4))
+make_btn(ds_body,"  Upload Data File",upload_dataset,color="#0e7490",fg_col="#e0f7fa")
+info_row=tk.Frame(ds_body,bg=CARD); info_row.pack(fill="x",pady=(6,0))
+rows_var=tk.StringVar(value="—"); cols_var=tk.StringVar(value="—"); num_cols_var=tk.StringVar(value="—")
+for title,var,col in [("Unique Wells",rows_var,COL_DATASET),("Columns",cols_var,FG_DIM),("Numeric",num_cols_var,"#f59e0b")]:
+    cf=tk.Frame(info_row,bg=CARD); cf.pack(side="left",expand=True,fill="x")
+    tk.Label(cf,text=title,bg=CARD,fg=FG_DIM,font=FONT_XS).pack(anchor="w")
+    tk.Label(cf,textvariable=var,bg=CARD,fg=col,font=("Courier New",13,"bold")).pack(anchor="w")
+event_col_var=tk.StringVar(value="Upload dataset to detect event column")
+event_col_lbl=tk.Label(ds_body,textvariable=event_col_var,bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420,justify="left",anchor="w")
+event_col_lbl.pack(fill="x",pady=(4,0))
+well_id_var=tk.StringVar(value="Well ID column: Not detected yet")
+well_id_lbl=tk.Label(ds_body,textvariable=well_id_var,bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420,justify="left",anchor="w")
+well_id_lbl.pack(fill="x",pady=(2,0))
 
-# ★ NEW ② FEATURE SELECTION
-feat_outer = make_section_card(sidebar, "② FEATURE SELECTION  (numeric + categorical)", COL_FEATURES)
+# ② FEATURE SELECTION
+feat_outer=make_section_card(sidebar,"② FEATURE SELECTION  (numeric + categorical)",COL_FEATURES)
 tk.Label(feat_outer,
-         text="Check features to include in clustering and anomaly detection.\n"
-              "Numeric → used for analysis.  Categorical → used for grouping.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420, justify="left").pack(anchor="w", pady=(0, 4))
+         text="Select columns for analysis.  Blue=numeric  |  Green=categorical.\n"
+              "Missing values handled automatically.",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420,justify="left").pack(anchor="w",pady=(0,4))
 
-# Numeric features sub-panel
-num_hdr = tk.Frame(feat_outer, bg=CARD); num_hdr.pack(fill="x", pady=(2, 1))
-tk.Label(num_hdr, text="NUMERIC FEATURES", bg=CARD, fg=COL_FEATURES,
-         font=FONT_H3).pack(side="left")
-feat_num_count_var = tk.StringVar(value="0/0 selected")
-tk.Label(num_hdr, textvariable=feat_num_count_var, bg=CARD, fg=FG_DIM,
-         font=FONT_XS).pack(side="right")
+feat_top_row=tk.Frame(feat_outer,bg=CARD); feat_top_row.pack(fill="x",pady=(0,3))
+feat_count_var=tk.StringVar(value="0 / 0 selected")
+tk.Label(feat_top_row,textvariable=feat_count_var,bg=CARD,fg=COL_FEATURES,font=FONT_H3).pack(side="left")
 
-# Search box for numeric
-num_search_row = tk.Frame(feat_outer, bg=CARD); num_search_row.pack(fill="x", pady=1)
-tk.Label(num_search_row, text="Search:", bg=CARD, fg=FG_DIM, font=FONT_XS).pack(side="left")
-feat_search_var_num = tk.StringVar()
-num_search_entry = tk.Entry(num_search_row, textvariable=feat_search_var_num,
-                            bg=CARD2, fg=FG, insertbackground=FG,
-                            font=FONT_XS, relief="flat", bd=2, width=22)
-num_search_entry.pack(side="left", padx=4)
-feat_search_var_num.trace_add("write", lambda *a: _filter_feat_checkboxes(
-    feat_search_var_num.get(), feat_num_frames, feat_num_vars))
+feat_search_row=tk.Frame(feat_outer,bg=CARD); feat_search_row.pack(fill="x",pady=(0,3))
+tk.Label(feat_search_row,text="Search:",bg=CARD,fg=FG_DIM,font=FONT_XS).pack(side="left")
+feat_search_var=tk.StringVar()
+feat_search_entry=tk.Entry(feat_search_row,textvariable=feat_search_var,
+                           bg=CARD2,fg=FG,insertbackground=FG,font=FONT_XS,relief="flat",bd=2,width=24)
+feat_search_entry.pack(side="left",padx=4)
+feat_search_var.trace_add("write",_filter_feat_list)
 
-# Select all / clear
-num_btn_row = tk.Frame(feat_outer, bg=CARD); num_btn_row.pack(fill="x", pady=(1, 2))
-def _sel_all_num():
-    for v in feat_num_vars.values(): v.set(True)
-def _clr_all_num():
-    for v in feat_num_vars.values(): v.set(False)
-for lbl, cmd in [("All", _sel_all_num), ("None", _clr_all_num)]:
-    tk.Button(num_btn_row, text=lbl, command=cmd, bg=CARD2, fg=COL_FEATURES,
-              activebackground=BORDER, activeforeground=FG,
-              font=FONT_XS, relief="flat", bd=0, cursor="hand2",
-              padx=8, pady=3).pack(side="left", padx=2)
+feat_btn_row=tk.Frame(feat_outer,bg=CARD); feat_btn_row.pack(fill="x",pady=(0,4))
+def _sel_all():
+    for v in feat_all_vars.values(): v.set(True)
+def _sel_none():
+    for v in feat_all_vars.values(): v.set(False)
+def _sel_numeric_only():
+    import pandas as pd
+    for col,v in feat_all_vars.items():
+        v.set(raw_data is not None and col in raw_data.columns and
+              pd.api.types.is_numeric_dtype(raw_data[col]))
+for lbl,cmd,fg_c in [("All",_sel_all,COL_FEATURES),
+                      ("None",_sel_none,FG_DIM),
+                      ("Numeric Only",_sel_numeric_only,"#f59e0b")]:
+    tk.Button(feat_btn_row,text=lbl,command=cmd,bg=CARD2,fg=fg_c,
+              activebackground=BORDER,activeforeground=FG,font=FONT_XS,
+              relief="flat",bd=0,cursor="hand2",padx=8,pady=3).pack(side="left",padx=2)
 
-# Scrollable numeric checkboxes
-feat_num_canvas_outer = tk.Frame(feat_outer, bg=CARD, height=150)
-feat_num_canvas_outer.pack(fill="x"); feat_num_canvas_outer.pack_propagate(False)
-feat_num_canvas = Canvas(feat_num_canvas_outer, bg=CARD, highlightthickness=0, bd=0)
-feat_num_sb = Scrollbar(feat_num_canvas_outer, orient="vertical", command=feat_num_canvas.yview,
-                        bg=BORDER, troughcolor=CARD, activebackground=COL_FEATURES)
-feat_num_canvas.configure(yscrollcommand=feat_num_sb.set)
-feat_num_sb.pack(side="right", fill="y"); feat_num_canvas.pack(side="left", fill="both", expand=True)
-feat_num_body = tk.Frame(feat_num_canvas, bg=CARD)
-fn_wid = feat_num_canvas.create_window((0, 0), window=feat_num_body, anchor="nw")
-def _fn_resize(e):
-    feat_num_canvas.configure(scrollregion=feat_num_canvas.bbox("all"))
-    feat_num_canvas.itemconfig(fn_wid, width=e.width)
-feat_num_body.bind("<Configure>", lambda e: feat_num_canvas.configure(scrollregion=feat_num_canvas.bbox("all")))
-feat_num_canvas.bind("<Configure>", _fn_resize)
-tk.Label(feat_num_body, text="Upload a dataset to see numeric columns.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, padx=8, pady=8).pack(anchor="w")
-
-_divider(feat_outer)
-
-# Categorical features sub-panel
-cat_hdr = tk.Frame(feat_outer, bg=CARD); cat_hdr.pack(fill="x", pady=(2, 1))
-tk.Label(cat_hdr, text="CATEGORICAL FEATURES", bg=CARD, fg=COL_EVENTS, font=FONT_H3).pack(side="left")
-feat_cat_count_var = tk.StringVar(value="0/0 selected")
-tk.Label(cat_hdr, textvariable=feat_cat_count_var, bg=CARD, fg=FG_DIM, font=FONT_XS).pack(side="right")
-
-cat_search_row = tk.Frame(feat_outer, bg=CARD); cat_search_row.pack(fill="x", pady=1)
-tk.Label(cat_search_row, text="Search:", bg=CARD, fg=FG_DIM, font=FONT_XS).pack(side="left")
-feat_search_var_cat = tk.StringVar()
-cat_search_entry = tk.Entry(cat_search_row, textvariable=feat_search_var_cat,
-                            bg=CARD2, fg=FG, insertbackground=FG,
-                            font=FONT_XS, relief="flat", bd=2, width=22)
-cat_search_entry.pack(side="left", padx=4)
-feat_search_var_cat.trace_add("write", lambda *a: _filter_feat_checkboxes(
-    feat_search_var_cat.get(), feat_cat_frames, feat_cat_vars))
-
-cat_btn_row = tk.Frame(feat_outer, bg=CARD); cat_btn_row.pack(fill="x", pady=(1, 2))
-def _sel_all_cat():
-    for v in feat_cat_vars.values(): v.set(True)
-def _clr_all_cat():
-    for v in feat_cat_vars.values(): v.set(False)
-for lbl, cmd in [("All", _sel_all_cat), ("None", _clr_all_cat)]:
-    tk.Button(cat_btn_row, text=lbl, command=cmd, bg=CARD2, fg=COL_EVENTS,
-              activebackground=BORDER, activeforeground=FG,
-              font=FONT_XS, relief="flat", bd=0, cursor="hand2",
-              padx=8, pady=3).pack(side="left", padx=2)
-
-feat_cat_canvas_outer = tk.Frame(feat_outer, bg=CARD, height=120)
-feat_cat_canvas_outer.pack(fill="x"); feat_cat_canvas_outer.pack_propagate(False)
-feat_cat_canvas = Canvas(feat_cat_canvas_outer, bg=CARD, highlightthickness=0, bd=0)
-feat_cat_sb = Scrollbar(feat_cat_canvas_outer, orient="vertical", command=feat_cat_canvas.yview,
-                        bg=BORDER, troughcolor=CARD, activebackground=COL_EVENTS)
-feat_cat_canvas.configure(yscrollcommand=feat_cat_sb.set)
-feat_cat_sb.pack(side="right", fill="y"); feat_cat_canvas.pack(side="left", fill="both", expand=True)
-feat_cat_body = tk.Frame(feat_cat_canvas, bg=CARD)
-fc_wid = feat_cat_canvas.create_window((0, 0), window=feat_cat_body, anchor="nw")
-def _fc_resize(e):
-    feat_cat_canvas.configure(scrollregion=feat_cat_canvas.bbox("all"))
-    feat_cat_canvas.itemconfig(fc_wid, width=e.width)
-feat_cat_body.bind("<Configure>", lambda e: feat_cat_canvas.configure(scrollregion=feat_cat_canvas.bbox("all")))
-feat_cat_canvas.bind("<Configure>", _fc_resize)
-tk.Label(feat_cat_body, text="Upload a dataset to see categorical columns.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, padx=8, pady=8).pack(anchor="w")
+feat_canvas_outer=tk.Frame(feat_outer,bg=CARD,height=200)
+feat_canvas_outer.pack(fill="x"); feat_canvas_outer.pack_propagate(False)
+feat_canvas=Canvas(feat_canvas_outer,bg=CARD,highlightthickness=0,bd=0)
+feat_sb=Scrollbar(feat_canvas_outer,orient="vertical",command=feat_canvas.yview,
+                  bg=BORDER,troughcolor=CARD,activebackground=COL_FEATURES)
+feat_canvas.configure(yscrollcommand=feat_sb.set)
+feat_sb.pack(side="right",fill="y"); feat_canvas.pack(side="left",fill="both",expand=True)
+feat_all_body=tk.Frame(feat_canvas,bg=CARD)
+fa_wid=feat_canvas.create_window((0,0),window=feat_all_body,anchor="nw")
+def _fa_resize(e):
+    feat_canvas.configure(scrollregion=feat_canvas.bbox("all"))
+    feat_canvas.itemconfig(fa_wid,width=e.width)
+feat_all_body.bind("<Configure>",lambda e: feat_canvas.configure(scrollregion=feat_canvas.bbox("all")))
+feat_canvas.bind("<Configure>",_fa_resize)
+tk.Label(feat_all_body,text="Upload a dataset to see all columns.",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,padx=8,pady=8).pack(anchor="w")
 
 # ③ CLUSTER SETTINGS
-cl_body = make_section_card(sidebar, "③ CLUSTER SETTINGS  (clusters wells, not records)", COL_CLUSTER)
+cl_body=make_section_card(sidebar,"③ CLUSTER SETTINGS",COL_CLUSTER)
 tk.Label(cl_body,
-         text="Clusters are built on per-well average profiles.\n"
-              "Fast even on 300k+ record datasets.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420).pack(anchor="w")
-cluster_var = tk.IntVar(value=3)
-sf = tk.Frame(cl_body, bg=CARD); sf.pack(fill="x", pady=4)
-tk_ttk.Spinbox(sf, from_=2, to=10, textvariable=cluster_var, width=5, font=FONT_H2).pack(side="left")
-tk.Label(sf, text="clusters  (of wells)", bg=CARD, fg=FG_DIM, font=FONT_SM).pack(side="left", padx=8)
+         text="Algorithm chain: KPrototypes → KModes → Gower → Ward → KMeans\n"
+              "Works with numeric-only, text-only, or mixed columns.",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420).pack(anchor="w")
+cluster_var=tk.IntVar(value=3)
+sf=tk.Frame(cl_body,bg=CARD); sf.pack(fill="x",pady=4)
+tk_ttk.Spinbox(sf,from_=2,to=10,textvariable=cluster_var,width=5,font=FONT_H2).pack(side="left")
+tk.Label(sf,text="well clusters",bg=CARD,fg=FG_DIM,font=FONT_SM).pack(side="left",padx=8)
 
-# ④ PARAMETER WEIGHTAGE
-wt_outer = make_section_card(sidebar, "④ PARAMETER WEIGHTAGE", COL_WEIGHTS)
-tk.Label(wt_outer, text="Assign % weight per numeric feature (total should = 100%).",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420).pack(anchor="w", pady=(0, 4))
-weight_sum_var = tk.StringVar(value="Upload a dataset to see parameters")
-weight_sum_lbl = tk.Label(wt_outer, textvariable=weight_sum_var, bg=CARD, fg=FG_DIM,
-                          font=("Courier New", 9, "bold"), anchor="w")
-weight_sum_lbl.pack(anchor="w", pady=(0, 4))
-wt_canvas_outer = tk.Frame(wt_outer, bg=CARD, height=160)
-wt_canvas_outer.pack(fill="x"); wt_canvas_outer.pack_propagate(False)
-wt_canvas = Canvas(wt_canvas_outer, bg=CARD, highlightthickness=0, bd=0)
-wt_sb = Scrollbar(wt_canvas_outer, orient="vertical", command=wt_canvas.yview,
-                  bg=BORDER, troughcolor=CARD, activebackground=COL_WEIGHTS)
-wt_canvas.configure(yscrollcommand=wt_sb.set)
-wt_sb.pack(side="right", fill="y"); wt_canvas.pack(side="left", fill="both", expand=True)
-weight_body = tk.Frame(wt_canvas, bg=CARD)
-wt_wid = wt_canvas.create_window((0, 0), window=weight_body, anchor="nw")
-def _wt_resize(e):
-    wt_canvas.configure(scrollregion=wt_canvas.bbox("all"))
-    wt_canvas.itemconfig(wt_wid, width=e.width)
-weight_body.bind("<Configure>", lambda e: wt_canvas.configure(scrollregion=wt_canvas.bbox("all")))
-wt_canvas.bind("<Configure>", _wt_resize)
-_wt_ph = tk.Label(weight_body, text="Upload a dataset first.",
-                  bg=CARD, fg=FG_DIM, font=FONT_XS, justify="left", padx=8, pady=8)
-_wt_ph.pack(anchor="w"); weight_row_frames = [_wt_ph]
+# ④ ANOMALY DETECTION
+anom_body=make_section_card(sidebar,"④ ANOMALY DETECTION",COL_ANOMALY)
+tk.Label(anom_body,text="Detects anomalous wells from their aggregated profiles.",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420).pack(anchor="w")
+anomaly_method_var=tk.StringVar(value="iforest")
+mrow=tk.Frame(anom_body,bg=CARD); mrow.pack(fill="x",pady=(2,6))
+for label,val in [("Isolation Forest  (faster, tree-based)","iforest"),
+                  ("Local Outlier Factor  (density-based)","lof")]:
+    tk.Radiobutton(mrow,text=label,variable=anomaly_method_var,value=val,
+                   bg=CARD,fg=FG_MID,selectcolor=CARD2,activebackground=CARD,
+                   activeforeground=COL_ANOMALY,font=FONT_SM,wraplength=420).pack(anchor="w",pady=1)
+anomaly_contam_var=tk.DoubleVar(value=5.0)
+crow=tk.Frame(anom_body,bg=CARD); crow.pack(fill="x",pady=2)
+tk_ttk.Spinbox(crow,from_=1.0,to=49.0,increment=0.5,textvariable=anomaly_contam_var,width=6,font=FONT_H3).pack(side="left")
+tk.Label(crow,text="% contamination  (typical: 3–10%)",bg=CARD,fg=FG_DIM,font=FONT_XS).pack(side="left",padx=6)
 
-# ⑤ ANOMALY DETECTION
-anom_body = make_section_card(sidebar, "⑤ ANOMALY DETECTION", COL_ANOMALY)
-tk.Label(anom_body, text="Algorithm", bg=CARD, fg=FG_DIM, font=FONT_SM).pack(anchor="w")
-anomaly_method_var = tk.StringVar(value="iforest")
-mrow = tk.Frame(anom_body, bg=CARD); mrow.pack(fill="x", pady=(2, 6))
-for label, val in [("Isolation Forest  (faster, tree-based)", "iforest"),
-                   ("Local Outlier Factor  (density-based)", "lof")]:
-    tk.Radiobutton(mrow, text=label, variable=anomaly_method_var, value=val,
-                   bg=CARD, fg=FG_MID, selectcolor=CARD2, activebackground=CARD,
-                   activeforeground=COL_ANOMALY, font=FONT_SM,
-                   wraplength=420).pack(anchor="w", pady=1)
-tk.Label(anom_body, text="Contamination %  (expected anomaly fraction)",
-         bg=CARD, fg=FG_DIM, font=FONT_SM).pack(anchor="w")
-anomaly_contam_var = tk.DoubleVar(value=5.0)
-crow = tk.Frame(anom_body, bg=CARD); crow.pack(fill="x", pady=2)
-tk_ttk.Spinbox(crow, from_=1.0, to=49.0, increment=0.5,
-               textvariable=anomaly_contam_var, width=6, font=FONT_H3).pack(side="left")
-tk.Label(crow, text="%  (typical CBM: 3–10%)", bg=CARD, fg=FG_DIM, font=FONT_XS).pack(side="left", padx=6)
-
-# ⑥ Per-parameter Z threshold
-pa_body = make_section_card(sidebar, "⑥ PER-PARAMETER  Z-Score Threshold", COL_PARAM_ANOM)
-tk.Label(pa_body, text="Lower = more anomalies per parameter.  Default 2.5.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420).pack(anchor="w", pady=(0, 4))
-zthresh_row = tk.Frame(pa_body, bg=CARD); zthresh_row.pack(fill="x", pady=2)
-zthresh_var = tk.DoubleVar(value=2.5)
-tk_ttk.Spinbox(zthresh_row, from_=1.0, to=5.0, increment=0.1,
-               textvariable=zthresh_var, width=6, font=FONT_H3).pack(side="left")
-tk.Label(zthresh_row, text="σ  (standard deviations from mean)",
-         bg=CARD, fg=FG_DIM, font=FONT_XS).pack(side="left", padx=6)
-
-# ⑦ RPM FILTER
-rpm_filter_body = make_section_card(sidebar, "⑦ RPM FILTER", "#f97316")
-tk.Label(rpm_filter_body, text="Select RPM states to include in anomaly detection.",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420).pack(anchor="w", pady=(0, 4))
-rpm_filter_all_var     = tk.BooleanVar(value=True)
-rpm_filter_running_var = tk.BooleanVar(value=True)
-rpm_filter_stopped_var = tk.BooleanVar(value=True)
-rpm_filter_reverse_var = tk.BooleanVar(value=True)
-rpm_filter_nodata_var  = tk.BooleanVar(value=True)
-def _rpm_all_toggle():
-    if rpm_filter_all_var.get():
-        for v in [rpm_filter_running_var, rpm_filter_stopped_var,
-                  rpm_filter_reverse_var, rpm_filter_nodata_var]:
-            v.set(True)
-tk.Checkbutton(rpm_filter_body, text="All RPM states (no filter)",
-               variable=rpm_filter_all_var, command=_rpm_all_toggle,
-               bg=CARD, fg=FG_MID, selectcolor=CARD2, activebackground=CARD,
-               activeforeground="#f97316", font=FONT_SM).pack(anchor="w", pady=1)
-_divider(rpm_filter_body)
-for label, var, col in [
-    ("Running  (RPM > 0)", rpm_filter_running_var, "#10b981"),
-    ("Stopped  (RPM = 0)", rpm_filter_stopped_var, "#f59e0b"),
-    ("Reverse  (RPM < 0)", rpm_filter_reverse_var, "#ef4444"),
-    ("No Data  (NaN/bad)", rpm_filter_nodata_var,  "#4a6080"),
-]:
-    tk.Checkbutton(rpm_filter_body, text=label, variable=var,
-                   bg=CARD, fg=col, selectcolor=CARD2, activebackground=CARD,
-                   activeforeground=col, font=FONT_SM).pack(anchor="w", pady=1)
-rpm_filter_info_var = tk.StringVar(value="No RPM column detected yet")
-tk.Label(rpm_filter_body, textvariable=rpm_filter_info_var, bg=CARD, fg=FG_DIM,
-         font=FONT_XS, wraplength=420).pack(anchor="w", pady=(4, 0))
-
-# ⑧ RUN
-run_body = make_section_card(sidebar, "⑧ RUN ANALYSIS", "#6366f1")
-make_btn(run_body, "  ▶  Run AI Analysis  (Well Clusters + Anomaly + Similarity)",
-         start_pipeline, color="#4f46e5",
-         tip="Well-based clustering + per-parameter anomaly + similarity + events")
+# ⑤ RUN
+run_body=make_section_card(sidebar,"⑤ RUN ANALYSIS","#6366f1")
+make_btn(run_body,"  ▶  Run AI Analysis  (Clustering + Anomaly + Hidden Patterns)",
+         start_pipeline,color="#4f46e5")
 if HAVE_TTKBS:
-    progress_bar = ttk.Progressbar(run_body, mode="determinate", bootstyle="info-striped", length=420)
+    progress_bar=ttk.Progressbar(run_body,mode="determinate",bootstyle="info-striped",length=420)
 else:
-    progress_bar = tk_ttk.Progressbar(run_body, mode="determinate", length=420)
-progress_bar.pack(fill="x", pady=(4, 2))
-status_var = tk.StringVar(value="Ready — upload a dataset to begin")
-status_lbl = tk.Label(run_body, textvariable=status_var, bg=CARD, fg=FG_DIM,
-                      font=FONT_SM, anchor="w", wraplength=420, justify="left")
-status_lbl.pack(fill="x", pady=(2, 0))
+    progress_bar=tk_ttk.Progressbar(run_body,mode="determinate",length=420)
+progress_bar.pack(fill="x",pady=(4,2))
+status_var=tk.StringVar(value="Ready — upload a dataset to begin")
+status_lbl=tk.Label(run_body,textvariable=status_var,bg=CARD,fg=FG_DIM,font=FONT_SM,anchor="w",wraplength=420,justify="left")
+status_lbl.pack(fill="x",pady=(2,0))
 
-# ⑨ EVENT DETECTION PANEL
-ev_body = make_section_card(sidebar, "⑨ EVENT DETECTION PANEL", COL_EVENTS)
-ev_status_var = tk.StringVar(value="Awaiting analysis")
-ev_status_lbl = tk.Label(ev_body, textvariable=ev_status_var, bg=CARD, fg=FG_DIM,
-                         font=FONT_SM, wraplength=420)
-ev_status_lbl.pack(anchor="w", pady=(0, 6))
-ev_tile_row = tk.Frame(ev_body, bg=CARD); ev_tile_row.pack(fill="x", pady=(0, 6))
-ev_active_var = tk.StringVar(value="—"); ev_inactive_var = tk.StringVar(value="—")
-ev_abnormal_var = tk.StringVar(value="—"); ev_op_anom_var = tk.StringVar(value="—")
-for title, var, col in [("Active Recs", ev_active_var, COL_EVENTS),
-                         ("Inactive Recs", ev_inactive_var, COL_ANOMALY),
-                         ("Abnormal", ev_abnormal_var, WARN),
-                         ("Op. Anom.", ev_op_anom_var, COL_WEIGHTS)]:
-    cell = tk.Frame(ev_tile_row, bg=CARD2, padx=5, pady=5,
-                    highlightbackground=BORDER, highlightthickness=1)
-    cell.pack(side="left", expand=True, fill="x", padx=2)
-    tk.Label(cell, textvariable=var, bg=CARD2, fg=col,
-             font=("Courier New", 11, "bold")).pack()
-    tk.Label(cell, text=title, bg=CARD2, fg=FG_DIM, font=FONT_XS).pack()
-_ev_label_names = [f"ev{i}" for i in range(6)]
-ev_count_vars = {}; ev_count_lbls = {}
-ev_detail_frame = tk.Frame(ev_body, bg=CARD); ev_detail_frame.pack(fill="x")
+# ⑥ EVENT DETECTION PANEL
+ev_body=make_section_card(sidebar,"⑥ EVENT DETECTION PANEL",COL_EVENTS)
+ev_status_var=tk.StringVar(value="Awaiting analysis")
+ev_status_lbl=tk.Label(ev_body,textvariable=ev_status_var,bg=CARD,fg=FG_DIM,font=FONT_SM,wraplength=420)
+ev_status_lbl.pack(anchor="w",pady=(0,6))
+ev_tile_row=tk.Frame(ev_body,bg=CARD); ev_tile_row.pack(fill="x",pady=(0,6))
+ev_active_var=tk.StringVar(value="—"); ev_inactive_var=tk.StringVar(value="—")
+ev_abnormal_var=tk.StringVar(value="—"); ev_op_anom_var=tk.StringVar(value="—")
+for title,var,col in [("Active Recs",ev_active_var,COL_EVENTS),("Inactive Recs",ev_inactive_var,COL_ANOMALY),
+                       ("Abnormal",ev_abnormal_var,WARN),("Op. Anom.",ev_op_anom_var,"#f59e0b")]:
+    cell=tk.Frame(ev_tile_row,bg=CARD2,padx=5,pady=5,highlightbackground=BORDER,highlightthickness=1)
+    cell.pack(side="left",expand=True,fill="x",padx=2)
+    tk.Label(cell,textvariable=var,bg=CARD2,fg=col,font=("Courier New",11,"bold")).pack()
+    tk.Label(cell,text=title,bg=CARD2,fg=FG_DIM,font=FONT_XS).pack()
+_ev_label_names=[f"ev{i}" for i in range(6)]
+ev_count_vars={}; ev_count_lbls={}
+ev_detail_frame=tk.Frame(ev_body,bg=CARD); ev_detail_frame.pack(fill="x")
 for key in _ev_label_names:
-    row = tk.Frame(ev_detail_frame, bg=CARD); row.pack(fill="x", pady=1)
-    lbl = tk.Label(row, text="—", bg=CARD, fg=FG_DIM, font=FONT_XS, width=26, anchor="w")
-    lbl.pack(side="left", padx=(4, 0))
-    cnt_var = tk.StringVar(value="—")
-    tk.Label(row, textvariable=cnt_var, bg=CARD, fg=COL_EVENTS,
-             font=FONT_XS, width=8, anchor="e").pack(side="right", padx=4)
-    ev_count_vars[key] = cnt_var; ev_count_lbls[key] = lbl
+    row=tk.Frame(ev_detail_frame,bg=CARD); row.pack(fill="x",pady=1)
+    lbl=tk.Label(row,text="—",bg=CARD,fg=FG_DIM,font=FONT_XS,width=26,anchor="w"); lbl.pack(side="left",padx=(4,0))
+    cnt_var=tk.StringVar(value="—")
+    tk.Label(row,textvariable=cnt_var,bg=CARD,fg=COL_EVENTS,font=FONT_XS,width=8,anchor="e").pack(side="right",padx=4)
+    ev_count_vars[key]=cnt_var; ev_count_lbls[key]=lbl
 
-# ⑩ EXPORT
-exp_body = make_section_card(sidebar, "⑩ EXPORT RESULTS", COL_EXPORT)
-tk.Label(exp_body,
-         text="Excel: All Records · Well Profiles · Anomaly Records\n"
-              "Cluster Summary · Parameter Weights · Parameter Anomalies · Insights Report",
-         bg=CARD, fg=FG_DIM, font=FONT_XS, wraplength=420).pack(anchor="w", pady=(0, 6))
-export_btn = tk.Button(exp_body, text="  Export All Results  (Excel / CSV)",
-                       command=export_results, bg="#14532d", fg=COL_EXPORT,
-                       activebackground=_lighten("#14532d", 20), activeforeground=COL_EXPORT,
-                       font=FONT_H3, relief="flat", bd=0, cursor="hand2",
-                       padx=10, pady=11, anchor="w", state="disabled")
-export_btn.pack(fill="x", pady=2)
-export_btn.bind("<Enter>", lambda e: export_btn.config(bg=_lighten("#14532d", 20)))
-export_btn.bind("<Leave>", lambda e: export_btn.config(bg="#14532d"))
+# ⑦ EXPORT
+exp_body=make_section_card(sidebar,"⑦ EXPORT RESULTS",COL_EXPORT)
+tk.Label(exp_body,text="Excel: All Records · Well Profiles · Anomaly Wells · Cluster Summary\nAnomaly Explanations · Insights Report",
+         bg=CARD,fg=FG_DIM,font=FONT_XS,wraplength=420).pack(anchor="w",pady=(0,6))
+export_btn=tk.Button(exp_body,text="  Export All Results  (Excel / CSV)",
+                     command=export_results,bg="#14532d",fg=COL_EXPORT,
+                     activebackground=_lighten("#14532d",20),activeforeground=COL_EXPORT,
+                     font=FONT_H3,relief="flat",bd=0,cursor="hand2",padx=10,pady=11,anchor="w",state="disabled")
+export_btn.pack(fill="x",pady=2)
+export_btn.bind("<Enter>",lambda e: export_btn.config(bg=_lighten("#14532d",20)))
+export_btn.bind("<Leave>",lambda e: export_btn.config(bg="#14532d"))
 
-# ⑪ DATASET PREVIEW
-prev_body = make_section_card(sidebar, "⑪ DATASET PREVIEW  (first 20 rows)", COL_PREVIEW,
-                              fill="both", expand=True)
-table_frame = tk.Frame(prev_body, bg=CARD); table_frame.pack(fill="both", expand=True)
-tk.Frame(sidebar, bg=SIDEBAR, height=20).pack()
+# ⑧ DATASET PREVIEW
+prev_body=make_section_card(sidebar,"⑧ DATASET PREVIEW  (first 20 rows)",COL_PREVIEW,fill="both",expand=True)
+table_frame=tk.Frame(prev_body,bg=CARD); table_frame.pack(fill="both",expand=True)
+tk.Frame(sidebar,bg=SIDEBAR,height=20).pack()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RIGHT PANEL
+# RIGHT PANEL — TABS + CHATBOT
 # ══════════════════════════════════════════════════════════════════════════════
-rp_outer, right_inner = make_scrollable(root_pane, bg=BG)
-root_pane.add(rp_outer, minsize=820)
-rp_hdr = tk.Frame(right_inner, bg=BG, padx=16, pady=10); rp_hdr.pack(fill="x")
-tk.Label(rp_hdr, text="Analysis Dashboard", bg=BG, fg=FG,
-         font=("Georgia", 15, "bold")).pack(side="left")
-tk.Label(rp_hdr, text="v6.0  ·  Well Clusters  ·  Feature Selection  ·  Param Similarity  ·  Events  ·  RPM",
-         bg=BG, fg=FG_DIM, font=FONT_SM).pack(side="right", pady=2)
-tk.Frame(right_inner, bg=BORDER, height=1).pack(fill="x", padx=12)
+rp_outer,right_inner=make_scrollable(root_pane,bg=BG)
+root_pane.add(rp_outer,minsize=900)
+rp_hdr=tk.Frame(right_inner,bg=BG,padx=16,pady=10); rp_hdr.pack(fill="x")
+tk.Label(rp_hdr,text="Analysis Dashboard",bg=BG,fg=FG,font=("Georgia",15,"bold")).pack(side="left")
+tk.Label(rp_hdr,text="v7.0  ·  Robust Mixed-Data Clustering  ·  Per-Well Anomaly Explanations  ·  AI Chatbot",
+         bg=BG,fg=FG_DIM,font=FONT_SM).pack(side="right",pady=2)
+tk.Frame(right_inner,bg=BORDER,height=1).pack(fill="x",padx=12)
 
-# Stat tiles
-stats_wrap = tk.Frame(right_inner, bg=BG, padx=10, pady=5); stats_wrap.pack(fill="x")
-stat_defs_r1 = [("Unique Wells", "—", COL_DATASET),  ("Total Records", "—", COL_CLUSTER),
-                ("Clusters", "—", COL_WEIGHTS),        ("Anomaly Recs", "—", COL_ANOMALY)]
-stat_defs_r2 = [("Active Recs", "—", COL_EVENTS),     ("Inactive Recs", "—", ERR),
-                ("Event Types", "—", WARN),             ("Abnormal Recs", "—", COL_ANOMALY)]
-stat_defs_r3 = [("RPM Running", "—", "#10b981"),       ("RPM Stopped", "—", "#f59e0b"),
-                ("RPM Reverse", "—", "#ef4444"),        ("Param Anomalies", "—", COL_PARAM_ANOM)]
-stat_widgets = {}
-for stat_row_defs in [stat_defs_r1, stat_defs_r2, stat_defs_r3]:
-    row = tk.Frame(stats_wrap, bg=BG); row.pack(fill="x", pady=2)
-    for title, val, col in stat_row_defs:
-        sf = tk.Frame(row, bg=CARD, padx=6, pady=6,
-                      highlightbackground=col, highlightthickness=1)
-        sf.pack(side="left", expand=True, fill="x", padx=3)
-        sv = tk.StringVar(value=val)
-        tk.Label(sf, textvariable=sv, bg=CARD, fg=col,
-                 font=("Courier New", 10, "bold"), wraplength=120, justify="center").pack(fill="x")
-        tk.Label(sf, text=title, bg=CARD, fg=FG_DIM,
-                 font=("Courier New", 7), wraplength=120, justify="center").pack(fill="x")
-        stat_widgets[title] = sv
+stats_wrap=tk.Frame(right_inner,bg=BG,padx=10,pady=5); stats_wrap.pack(fill="x")
+stat_defs_r1=[("Unique Wells","—",COL_DATASET),("Total Records","—",COL_CLUSTER),
+              ("Clusters","—","#f59e0b"),("Anomaly Wells","—",COL_ANOMALY)]
+stat_defs_r2=[("Active Recs","—",COL_EVENTS),("Inactive Recs","—",ERR),
+              ("Event Types","—",WARN),("Abnormal Recs","—",COL_ANOMALY)]
+stat_widgets={}
+for stat_row_defs in [stat_defs_r1,stat_defs_r2]:
+    row=tk.Frame(stats_wrap,bg=BG); row.pack(fill="x",pady=2)
+    for title,val,col in stat_row_defs:
+        sf=tk.Frame(row,bg=CARD,padx=6,pady=6,highlightbackground=col,highlightthickness=1)
+        sf.pack(side="left",expand=True,fill="x",padx=3)
+        sv=tk.StringVar(value=val)
+        tk.Label(sf,textvariable=sv,bg=CARD,fg=col,font=("Courier New",10,"bold"),wraplength=120,justify="center").pack(fill="x")
+        tk.Label(sf,text=title,bg=CARD,fg=FG_DIM,font=("Courier New",7),wraplength=120,justify="center").pack(fill="x")
+        stat_widgets[title]=sv
 
-# TABS
-nb_wrap = tk.Frame(right_inner, bg=BG, padx=10, pady=6); nb_wrap.pack(fill="x")
-sty = tk_ttk.Style()
-sty.configure("CBM.TNotebook",     background=BG, tabmargins=[0, 0, 0, 0])
-sty.configure("CBM.TNotebook.Tab", background=CARD2, foreground=FG_DIM,
-              padding=[12, 6], font=FONT_H3)
-sty.map("CBM.TNotebook.Tab",
-        background=[("selected", "#1e3a8a")], foreground=[("selected", "#93c5fd")])
-notebook = tk_ttk.Notebook(nb_wrap, style="CBM.TNotebook"); notebook.pack(fill="x")
+# NOTEBOOK
+nb_wrap=tk.Frame(right_inner,bg=BG,padx=10,pady=6); nb_wrap.pack(fill="x")
+sty=tk_ttk.Style()
+sty.configure("CBM.TNotebook",background=BG,tabmargins=[0,0,0,0])
+sty.configure("CBM.TNotebook.Tab",background=CARD2,foreground=FG_DIM,padding=[12,6],font=FONT_H3)
+sty.map("CBM.TNotebook.Tab",background=[("selected","#1e3a8a")],foreground=[("selected","#93c5fd")])
+notebook=tk_ttk.Notebook(nb_wrap,style="CBM.TNotebook"); notebook.pack(fill="x")
 
-TAB_H = 500
-cluster_tab    = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-pca_tab        = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-reservoir_tab  = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-production_tab = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-hidden_tab     = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-weight_tab     = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-event_tab      = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-rpm_tab        = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-param_anom_tab = tk.Frame(notebook, bg=BG_MID, height=TAB_H)
-similarity_tab = tk.Frame(notebook, bg=BG_MID, height=TAB_H)   # NEW
+TAB_H=500
+cluster_tab =tk.Frame(notebook,bg=BG_MID,height=TAB_H)
+pca_tab     =tk.Frame(notebook,bg=BG_MID,height=TAB_H)
+hidden_tab  =tk.Frame(notebook,bg=BG_MID,height=TAB_H)
+event_tab   =tk.Frame(notebook,bg=BG_MID,height=TAB_H)
 
-for tab, name in [
-    (cluster_tab,    "  Clusters  "),
-    (pca_tab,        "  PCA  "),
-    (reservoir_tab,  "  3D Reservoir  "),
-    (production_tab, "  Production  "),
-    (hidden_tab,     "  Hidden Patterns  "),
-    (weight_tab,     "  Param Weights  "),
-    (event_tab,      "  Events  "),
-    (rpm_tab,        "  RPM Status  "),
-    (param_anom_tab, "  ★ Param Anomaly  "),
-    (similarity_tab, "  ★ Similarity  "),   # NEW
+for tab,name in [
+    (cluster_tab,  "  Well Clusters  "),
+    (pca_tab,      "  PCA  "),
+    (hidden_tab,   "  Hidden Patterns  "),
+    (event_tab,    "  Events  "),
 ]:
-    tab.pack_propagate(False); notebook.add(tab, text=name)
+    tab.pack_propagate(False); notebook.add(tab,text=name)
 
-# Insights Report
-ins_wrap = tk.Frame(right_inner, bg=BG, padx=10, pady=6); ins_wrap.pack(fill="x")
-ins_hdr = tk.Frame(ins_wrap, bg=BG); ins_hdr.pack(fill="x", pady=(0, 4))
-tk.Label(ins_hdr,
-         text="AI Insights Report  —  Well Clusters · Param Similarity · Anomaly Diagnosis",
-         bg=BG, fg=FG, font=FONT_H2).pack(side="left")
-copy_btn = tk.Button(ins_hdr, text="Copy",
-                     command=lambda: (app.clipboard_clear(),
-                                     app.clipboard_append(explain_text.get("1.0", "end"))),
-                     bg=CARD2, fg=FG_DIM, activebackground=BORDER, activeforeground=FG,
-                     font=FONT_XS, relief="flat", bd=0, cursor="hand2", padx=10, pady=4)
+# INSIGHTS
+ins_wrap=tk.Frame(right_inner,bg=BG,padx=10,pady=6); ins_wrap.pack(fill="x")
+ins_hdr=tk.Frame(ins_wrap,bg=BG); ins_hdr.pack(fill="x",pady=(0,4))
+tk.Label(ins_hdr,text="AI Insights Report  —  Per-Well Anomaly Explanations  ·  Cluster Summary  ·  Events",
+         bg=BG,fg=FG,font=FONT_H2).pack(side="left")
+copy_btn=tk.Button(ins_hdr,text="Copy",
+                   command=lambda:(app.clipboard_clear(),app.clipboard_append(explain_text.get("1.0","end"))),
+                   bg=CARD2,fg=FG_DIM,activebackground=BORDER,activeforeground=FG,
+                   font=FONT_XS,relief="flat",bd=0,cursor="hand2",padx=10,pady=4)
 copy_btn.pack(side="right")
-explain_text_frame = tk.Frame(ins_wrap, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-explain_text_frame.pack(fill="both", expand=True)
-explain_xsb = tk_ttk.Scrollbar(explain_text_frame, orient="horizontal")
-explain_vsb = tk_ttk.Scrollbar(explain_text_frame, orient="vertical")
-explain_text = tk.Text(explain_text_frame, height=26, bg=CARD, fg="#a8f0c8",
-                       font=("Courier New", 9), relief="flat", bd=0,
-                       padx=14, pady=10, insertbackground=FG, wrap="none",
-                       xscrollcommand=explain_xsb.set, yscrollcommand=explain_vsb.set,
-                       highlightthickness=0, state="disabled")
-explain_xsb.config(command=explain_text.xview)
-explain_vsb.config(command=explain_text.yview)
-explain_vsb.pack(side="right", fill="y")
-explain_xsb.pack(side="bottom", fill="x")
-explain_text.pack(side="left", fill="both", expand=True)
-tk.Frame(right_inner, bg=BG, height=20).pack()
+explain_text_frame=tk.Frame(ins_wrap,bg=CARD,highlightbackground=BORDER,highlightthickness=1)
+explain_text_frame.pack(fill="both",expand=True)
+explain_xsb=tk_ttk.Scrollbar(explain_text_frame,orient="horizontal")
+explain_vsb=tk_ttk.Scrollbar(explain_text_frame,orient="vertical")
+explain_text=tk.Text(explain_text_frame,height=28,bg=CARD,fg="#a8f0c8",
+                     font=("Courier New",9),relief="flat",bd=0,padx=14,pady=10,
+                     insertbackground=FG,wrap="none",
+                     xscrollcommand=explain_xsb.set,yscrollcommand=explain_vsb.set,
+                     highlightthickness=0,state="disabled")
+explain_xsb.config(command=explain_text.xview); explain_vsb.config(command=explain_text.yview)
+explain_vsb.pack(side="right",fill="y"); explain_xsb.pack(side="bottom",fill="x")
+explain_text.pack(side="left",fill="both",expand=True)
 
+# ── AI CHATBOT ────────────────────────────────────────────────────────────────
+chat_wrap=tk.Frame(right_inner,bg=BG,padx=10,pady=6); chat_wrap.pack(fill="x")
+chat_hdr=tk.Frame(chat_wrap,bg=BG,pady=4); chat_hdr.pack(fill="x")
+tk.Label(chat_hdr,text="★ AI Assistant  (Claude-powered CBM Chatbot)",
+         bg=BG,fg=COL_CHATBOT,font=FONT_H2).pack(side="left")
+tk.Button(chat_hdr,text="Clear Chat",command=clear_chat,
+          bg=CARD2,fg=FG_DIM,activebackground=BORDER,activeforeground=FG,
+          font=FONT_XS,relief="flat",bd=0,cursor="hand2",padx=10,pady=4).pack(side="right")
+
+chat_outer=tk.Frame(chat_wrap,bg=CARD,highlightbackground=COL_CHATBOT,highlightthickness=1)
+chat_outer.pack(fill="x")
+
+chat_display_frame=tk.Frame(chat_outer,bg=CARD)
+chat_display_frame.pack(fill="both",expand=True)
+chat_vsb=tk_ttk.Scrollbar(chat_display_frame,orient="vertical")
+chat_display=tk.Text(chat_display_frame,height=16,bg=CARD,fg=FG,
+                     font=("Courier New",9),relief="flat",bd=0,padx=12,pady=8,
+                     wrap="word",yscrollcommand=chat_vsb.set,
+                     highlightthickness=0,state="disabled")
+chat_vsb.config(command=chat_display.yview)
+chat_vsb.pack(side="right",fill="y"); chat_display.pack(side="left",fill="both",expand=True)
+
+chat_input_frame=tk.Frame(chat_outer,bg=CARD2,pady=6,padx=6)
+chat_input_frame.pack(fill="x")
+
+chat_input_label=tk.Label(chat_input_frame,text="Ask:",bg=CARD2,fg=COL_CHATBOT,font=FONT_H3)
+chat_input_label.pack(side="left",padx=(0,6))
+chat_input=tk.Text(chat_input_frame,height=3,bg=CARD,fg=FG,insertbackground=FG,
+                   font=("Courier New",9),relief="flat",bd=2,wrap="word",
+                   highlightbackground=COL_CHATBOT,highlightthickness=1)
+chat_input.pack(side="left",fill="x",expand=True,padx=(0,6))
+
+def _on_enter(event):
+    if not event.state & 0x1:  # no shift held
+        send_chat_message()
+        return "break"
+chat_input.bind("<Return>", _on_enter)
+
+send_btn=tk.Button(chat_input_frame,text="Send\n(Enter)",command=send_chat_message,
+                   bg="#4f46e5",fg="#fff",activebackground=_lighten("#4f46e5"),activeforeground="#fff",
+                   font=FONT_XS,relief="flat",bd=0,cursor="hand2",padx=10,pady=6)
+send_btn.pack(side="left")
+
+tk.Label(chat_input_frame,text="Shift+Enter=newline",bg=CARD2,fg=FG_DIM,font=("Courier New",7)).pack(side="left",padx=6)
+
+tk.Frame(right_inner,bg=BG,height=20).pack()
+
+# Initialise chatbot display
+clear_chat()
+
+# Initial insights text
 explain_text.config(state="normal")
 explain_text.insert("end",
-    "========================================================\n"
-    "  CBM AI Analytics Platform  v6.0\n"
-    "  Well Clustering + Feature Selection + Param Similarity\n"
-    "========================================================\n"
-    "\n"
-    "  WHAT'S NEW IN v6.0:\n"
-    "  ------------------------------------------------------\n"
-    "  ★ FEATURE SELECTION PANEL (sidebar section II):\n"
-    "    - Checkboxes for every numeric column\n"
-    "    - Checkboxes for categorical columns\n"
-    "    - Search/filter box to find columns quickly\n"
-    "    - Select All / Clear All buttons per group\n"
-    "    - Live count of selected features\n"
-    "\n"
-    "  ★ WELL-BASED CLUSTERING:\n"
-    "    - Groups records by Well ID first\n"
-    "    - Computes per-well mean, std, min, max, p25, p75\n"
-    "    - Clusters on WELL PROFILES (not raw records)\n"
-    "    - 300k records → 287 well vectors = very fast\n"
-    "    - Meaningful: wells with similar production group together\n"
-    "\n"
-    "  ★ PARAMETER SIMILARITY TAB:\n"
-    "    - Pearson correlation heatmap between all features\n"
-    "    - Cosine similarity matrix (normalised)\n"
-    "    - Right panel shows top correlated feature pairs\n"
-    "    - Helps identify redundant / independent features\n"
-    "\n"
-    "  ★ FAST LOADING:\n"
-    "    - CSV files > 50 MB are streamed in 200k-row chunks\n"
-    "    - No memory crash on large files\n"
-    "    - Progress updates during loading\n"
-    "\n"
+    "============================================================\n"
+    "  CBM AI Analytics Platform  v7.0\n"
+    "  Enhanced Hidden Pattern Explanations + AI Chatbot\n"
+    "============================================================\n\n"
+    "  WHAT'S NEW IN v7.0:\n"
+    "  ----------------------------------------------------------\n"
+    "  ✔ REMOVED tabs: Parameter Weights, RPM Status,\n"
+    "                  Param Anomaly, Similarity\n\n"
+    "  ✔ ENHANCED HIDDEN PATTERN INSIGHTS:\n"
+    "     For each anomalous well:\n"
+    "     • Which parameters are out of range\n"
+    "     • Exact z-scores (e.g. z=+3.8σ above mean)\n"
+    "     • Fleet average vs well value comparison\n"
+    "     • P10–P90 normal range\n"
+    "     • Plain-English explanation of WHY\n"
+    "     • Cluster membership of anomalous well\n\n"
+    "  ✔ AI CHATBOT (Claude-powered):\n"
+    "     Ask questions about the app or analysis results.\n"
+    "     The chatbot receives the full insights report\n"
+    "     as context and answers specific questions.\n\n"
     "  QUICK START:\n"
-    "  ------------------------------------------------------\n"
-    "  1. Upload your data file\n"
-    "  2. Select features in the Feature Selection panel\n"
-    "  3. Set number of clusters\n"
-    "  4. Assign parameter weights (optional)\n"
-    "  5. Set anomaly contamination %\n"
-    "  6. Click  ▶  Run AI Analysis\n"
-    "\n"
-    "  After analysis:\n"
-    "  → [Clusters] tab: one point per WELL (not per record)\n"
-    "  → [★ Similarity] tab: which parameters behave alike\n"
-    "  → [★ Param Anomaly] tab: which parameters have outliers\n"
-    "  → Read the Insights Report below for full diagnosis\n"
-    "========================================================\n"
+    "  ----------------------------------------------------------\n"
+    "  1. Upload data file  (any format)\n"
+    "  2. Select features to analyse\n"
+    "  3. Set cluster count + anomaly contamination %\n"
+    "  4. Click Run AI Analysis\n"
+    "  5. Read per-well explanations in Insights Report\n"
+    "  6. Ask the AI Chatbot for deeper analysis\n"
+    "============================================================\n"
 )
 explain_text.config(state="disabled")
 
