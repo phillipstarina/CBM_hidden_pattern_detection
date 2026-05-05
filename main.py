@@ -1,18 +1,14 @@
 """
-CBM AI Analytics Platform — v7.0
-─────────────────────────────────────────────
-CHANGES FROM v6.2:
-• REMOVED: Parameter Weights tab, RPM Status tab,
-           Param Anomaly tab, Similarity tab
-• REMOVED: RPM detection, parameter weight panel (sidebar ④),
-           Z-score threshold panel (sidebar ⑥),
-           RPM filter panel (sidebar ⑦)
-• ENHANCED INSIGHTS: Hidden Pattern section now explains
-  WHICH wells are anomalous, WHICH parameters drove the
-  detection, WHY (z-scores, distributions, median shifts)
-• NEW: AI CHATBOT panel — answers any question about
-  the app, the data, and the analysis results using
-  Claude API (claude-sonnet-4-20250514)
+CBM AI Analytics Platform — v7.0  (Floating Chatbot Edition)
+─────────────────────────────────────────────────────────────
+CHANGES FROM v7.0 base:
+• CHATBOT moved from embedded panel to a FLOATING ICON BUTTON
+  - Small pulsing ★ AI icon pinned to bottom-right of the window
+  - Click to open/close a compact 380×520px popup chat panel
+  - Panel appears above the icon, stays on top of all other widgets
+  - Drag the popup by its title bar to reposition
+  - ESC or the × button closes the panel
+  - All chat functionality identical to the embedded version
 """
 
 import tkinter as tk
@@ -896,17 +892,12 @@ def build_anomaly_X(well_df, num_agg_cols, cat_agg_cols, weight_map):
 # ══════════════════════════════════════════════════════════════════════════════
 def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
                              anomaly_scores, well_id_col, z_threshold=2.5):
-    """
-    For each anomalous well: identify WHICH parameters are out of range,
-    compute z-scores, explain WHY, and return structured list of dicts.
-    """
     import pandas as pd
 
     anom_idx = np.where(anomaly_labels == -1)[0]
     if len(anom_idx) == 0:
         return []
 
-    # Compute global stats on numeric agg cols across ALL wells
     num_stats = {}
     for c in num_agg_cols:
         vals = well_df[c].dropna().values.astype(float)
@@ -927,7 +918,6 @@ def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
         score = float(anomaly_scores[idx]) if idx < len(anomaly_scores) else 0.0
 
         flagged_params = []
-        # Numeric analysis
         for c in num_agg_cols:
             if c not in num_stats:
                 continue
@@ -960,13 +950,12 @@ def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
                                f"Normal range P10–P90: {st['p10']:.4f}–{st['p90']:.4f}.")
                 })
 
-        # Categorical analysis — compare to global mode
         for c in cat_agg_cols:
             val = str(row.get(c, "MISSING"))
             all_vals = well_df[c].fillna("MISSING").astype(str)
             global_mode = str(all_vals.mode().iloc[0]) if len(all_vals.mode()) > 0 else "UNKNOWN"
             freq = (all_vals == val).sum() / max(len(all_vals), 1) * 100
-            if freq < 5:  # rare category
+            if freq < 5:
                 flagged_params.append({
                     "param": c,
                     "value": val,
@@ -976,7 +965,6 @@ def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
                                f"Most common: '{global_mode}'.")
                 })
 
-        # Sort by |z_score| descending
         flagged_params.sort(key=lambda x: abs(x.get("z_score") or 0), reverse=True)
 
         explanations.append({
@@ -987,7 +975,6 @@ def explain_anomalous_wells(well_df, num_agg_cols, cat_agg_cols, anomaly_labels,
             "n_flagged": len(flagged_params)
         })
 
-    # Sort by anomaly score (most anomalous first)
     explanations.sort(key=lambda x: x["anomaly_score"])
     return explanations
 
@@ -1291,7 +1278,6 @@ def run_pipeline():
 
         app.after(0, lambda: set_status(f"Clustering {n_wells:,} well profiles…", WARN))
 
-        # Equal weights
         weight_map = {c: round(100/max(len(num_sel),1),2) for c in num_sel}
 
         n_clusters = min(cluster_var.get(), n_wells)
@@ -1327,7 +1313,6 @@ def run_pipeline():
         a_labels_rec = wdf["anomaly"].values
         event_result = analyse_events(wdf, a_labels_rec)
 
-        # Detailed per-well anomaly explanation
         z_thr = 2.5
         well_explanations = explain_anomalous_wells(
             well_df_clean, num_agg_cols, cat_agg_cols,
@@ -1518,7 +1503,6 @@ def _generate_insights(wdf, well_df, num_cols, selected_cols, n_rows, n_unique_w
             f"  Anomalous wells    : {n_anom:,}  ({a_pct:.1f}%)",
             f"  Overall Severity   : {sev_label}",B]
 
-    # ── DETAILED HIDDEN PATTERN EXPLANATIONS ──────────────────────────────────
     lines += [W, "  HIDDEN PATTERN ANALYSIS  —  WHY EACH WELL IS ANOMALOUS", "  "+D]
     if not well_explanations:
         lines += ["  No anomalous wells detected.", B]
@@ -1564,7 +1548,6 @@ def _generate_insights(wdf, well_df, num_cols, selected_cols, n_rows, n_unique_w
                         lines.append(f"  │    {'WHY: ' if i==0 else '      '}{rl}")
             lines += ["  └" + "─"*54, B]
 
-    # ── CLUSTER SUMMARY ───────────────────────────────────────────────────────
     if "cluster" in well_df.columns:
         lines += [W, "  CLUSTER SUMMARY", "  "+D]
         for cl in sorted(well_df["cluster"].unique()):
@@ -1575,7 +1558,6 @@ def _generate_insights(wdf, well_df, num_cols, selected_cols, n_rows, n_unique_w
                 f"  Cluster {cl}:  {n_cl:,} wells  |  {anom_in_cl} anomalous "
                 f"({anom_in_cl/max(n_cl,1)*100:.1f}%)"
             ]
-            # Show mean of top numeric cols per cluster
             import pandas as pd
             top_cols = [c for c in num_cols if f"{c}__mean" in grp.columns][:4]
             for c in top_cols:
@@ -1596,7 +1578,7 @@ def _generate_insights(wdf, well_df, num_cols, selected_cols, n_rows, n_unique_w
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AI CHATBOT
+# AI CHATBOT — LOGIC (unchanged from v7.0)
 # ══════════════════════════════════════════════════════════════════════════════
 CHATBOT_SYSTEM = """You are an expert AI assistant embedded inside the CBM AI Analytics Platform v7.0,
 a Coalbed Methane (CBM) well analytics desktop application built in Python/Tkinter.
@@ -1609,7 +1591,7 @@ You help the user understand:
 5. TROUBLESHOOTING — why something might not work, what data formats are needed
 
 Key app facts:
-- Tabs: Well Clusters, PCA, Hidden Patterns, Events (Parameter Weights/RPM/Param Anomaly/Similarity were removed in v7.0)
+- Tabs: Well Clusters, PCA, Hidden Patterns, Events
 - Clustering algorithm chain: KPrototypes → KModes → Gower/Agglomerative → Ward → KMeans
 - Anomaly detection: Isolation Forest or Local Outlier Factor on well profiles
 - Data: aggregates raw records per well (mean/std/min/max for numeric, mode for categorical)
@@ -1621,7 +1603,6 @@ Be concise but thorough. Use plain English. Format with bullet points when listi
 """
 
 def _build_context_for_chatbot():
-    """Build a short context string from current analysis state."""
     parts = []
     if raw_data is not None:
         parts.append(f"Dataset loaded: {len(raw_data):,} rows × {len(raw_data.columns)} columns.")
@@ -1635,7 +1616,6 @@ def _build_context_for_chatbot():
         parts.append(f"Anomaly detector: {active_anomaly_result['detector_name']}")
         parts.append(f"Anomaly rate: {active_anomaly_result['pct']:.1f}%")
     if active_insights_text and len(active_insights_text) > 50:
-        # Provide the full insights report to chatbot
         parts.append("\n\nFULL INSIGHTS REPORT:\n" + active_insights_text[:6000])
     return "\n".join(parts)
 
@@ -1668,7 +1648,6 @@ def _call_claude_api(user_msg):
         system_msg += f"\n\nCURRENT ANALYSIS CONTEXT:\n{context}"
 
     chatbot_history.append({"role": "user", "content": user_msg})
-    # Keep last 20 turns
     history_trimmed = chatbot_history[-20:]
 
     payload = json.dumps({
@@ -1705,7 +1684,6 @@ def _call_claude_api(user_msg):
 
     chatbot_history.append({"role": "assistant", "content": reply})
 
-    # Remove "Thinking…" and add real reply
     def _update():
         chat_display.config(state="normal")
         content = chat_display.get("1.0", "end")
@@ -1730,7 +1708,7 @@ def clear_chat():
     chat_display.delete("1.0", "end")
     chat_display.insert("end",
         "CBM·AI Assistant ready.\n"
-        "Ask me anything about the app, your data, or the analysis results.\n"
+        "Ask me anything about the app, your data, or the analysis results.\n\n"
         "Examples:\n"
         "  • Why is well X anomalous?\n"
         "  • What does the cluster analysis tell me?\n"
@@ -1738,6 +1716,201 @@ def clear_chat():
         "  • What file formats are supported?\n"
     )
     chat_display.config(state="disabled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLOATING CHATBOT PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+_chat_popup = None
+_chat_popup_visible = False
+_drag_offset_x = 0
+_drag_offset_y = 0
+_pulse_state = [0]
+_pulse_job = [None]
+
+def _pulse_icon():
+    """Animate the chatbot icon with a subtle glow cycle."""
+    if _chat_popup_visible:
+        chat_fab_btn.config(bg="#7c3aed", fg="#fff")
+        if _pulse_job[0]:
+            app.after_cancel(_pulse_job[0])
+        return
+    colors = ["#4f46e5", "#6d28d9", "#7c3aed", "#6d28d9"]
+    _pulse_state[0] = (_pulse_state[0] + 1) % len(colors)
+    chat_fab_btn.config(bg=colors[_pulse_state[0]])
+    _pulse_job[0] = app.after(800, _pulse_icon)
+
+def _start_drag(event):
+    global _drag_offset_x, _drag_offset_y
+    _drag_offset_x = event.x_root - _chat_popup.winfo_x()
+    _drag_offset_y = event.y_root - _chat_popup.winfo_y()
+
+def _do_drag(event):
+    x = event.x_root - _drag_offset_x
+    y = event.y_root - _drag_offset_y
+    _chat_popup.geometry(f"+{x}+{y}")
+
+def toggle_chat_popup():
+    global _chat_popup, _chat_popup_visible
+
+    if _chat_popup_visible and _chat_popup and _chat_popup.winfo_exists():
+        _chat_popup.withdraw()
+        _chat_popup_visible = False
+        chat_fab_btn.config(text="★ AI", bg="#4f46e5")
+        _pulse_job[0] = app.after(800, _pulse_icon)
+        return
+
+    # Create popup if it doesn't exist yet
+    if _chat_popup is None or not _chat_popup.winfo_exists():
+        _build_chat_popup()
+
+    # Position above the FAB button
+    app.update_idletasks()
+    fab_x = chat_fab_btn.winfo_rootx()
+    fab_y = chat_fab_btn.winfo_rooty()
+    popup_w, popup_h = 390, 540
+    px = max(10, fab_x - popup_w + chat_fab_btn.winfo_width())
+    py = max(10, fab_y - popup_h - 8)
+    _chat_popup.geometry(f"{popup_w}x{popup_h}+{px}+{py}")
+    _chat_popup.deiconify()
+    _chat_popup.lift()
+    _chat_popup_visible = True
+    chat_fab_btn.config(text="✕ AI", bg="#7c3aed")
+    if _pulse_job[0]:
+        app.after_cancel(_pulse_job[0])
+
+def _build_chat_popup():
+    global _chat_popup, chat_display, chat_input
+
+    popup = tk.Toplevel(app)
+    popup.overrideredirect(True)          # no OS titlebar
+    popup.configure(bg="#0a0f1e")
+    popup.attributes("-topmost", True)
+    popup.resizable(False, False)
+
+    # Drop shadow effect via outer border
+    outer = tk.Frame(popup, bg="#e879f9", padx=1, pady=1)
+    outer.pack(fill="both", expand=True)
+    inner = tk.Frame(outer, bg="#0a0f1e")
+    inner.pack(fill="both", expand=True)
+
+    # ── Title bar (draggable) ──────────────────────────────────────────────
+    title_bar = tk.Frame(inner, bg="#150a2e", height=36, cursor="fleur")
+    title_bar.pack(fill="x"); title_bar.pack_propagate(False)
+
+    tk.Label(title_bar, text="★", bg="#150a2e", fg=COL_CHATBOT,
+             font=("Georgia", 13, "bold")).pack(side="left", padx=(10,4), pady=4)
+    tk.Label(title_bar, text="CBM·AI Assistant", bg="#150a2e", fg=COL_CHATBOT,
+             font=("Georgia", 10, "bold")).pack(side="left", pady=4)
+
+    def _close_popup():
+        global _chat_popup_visible
+        popup.withdraw()
+        _chat_popup_visible = False
+        chat_fab_btn.config(text="★ AI", bg="#4f46e5")
+        _pulse_job[0] = app.after(800, _pulse_icon)
+
+    close_btn = tk.Button(title_bar, text="✕", command=_close_popup,
+                          bg="#150a2e", fg="#94a3b8",
+                          activebackground="#1e1040", activeforeground="#f87171",
+                          font=("Courier New", 11, "bold"), relief="flat",
+                          bd=0, cursor="hand2", padx=10, pady=0)
+    close_btn.pack(side="right", fill="y")
+
+    clear_btn = tk.Button(title_bar, text="Clear", command=lambda: _do_clear(),
+                          bg="#150a2e", fg="#4a6080",
+                          activebackground="#1e1040", activeforeground=FG,
+                          font=("Courier New", 8), relief="flat",
+                          bd=0, cursor="hand2", padx=8)
+    clear_btn.pack(side="right", fill="y", pady=4)
+
+    # Drag bindings
+    title_bar.bind("<ButtonPress-1>", _start_drag)
+    title_bar.bind("<B1-Motion>", _do_drag)
+    for child in title_bar.winfo_children():
+        if isinstance(child, tk.Label):
+            child.bind("<ButtonPress-1>", _start_drag)
+            child.bind("<B1-Motion>", _do_drag)
+
+    # Separator
+    tk.Frame(inner, bg=COL_CHATBOT, height=1).pack(fill="x")
+
+    # ── Chat display ───────────────────────────────────────────────────────
+    disp_frame = tk.Frame(inner, bg=CARD)
+    disp_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+    chat_vsb2 = tk_ttk.Scrollbar(disp_frame, orient="vertical")
+    chat_display = tk.Text(disp_frame, bg="#0c1424", fg=FG,
+                           font=("Courier New", 9), relief="flat", bd=0,
+                           padx=10, pady=8, wrap="word",
+                           yscrollcommand=chat_vsb2.set,
+                           highlightthickness=0, state="disabled",
+                           selectbackground=ACCENT)
+    chat_vsb2.config(command=chat_display.yview)
+    chat_vsb2.pack(side="right", fill="y")
+    chat_display.pack(side="left", fill="both", expand=True)
+
+    # ── Separator ──────────────────────────────────────────────────────────
+    tk.Frame(inner, bg="#1e1040", height=1).pack(fill="x")
+
+    # ── Input area ─────────────────────────────────────────────────────────
+    input_area = tk.Frame(inner, bg="#0e0b1e", padx=8, pady=6)
+    input_area.pack(fill="x")
+
+    chat_input = tk.Text(input_area, height=3, bg="#131b2a", fg=FG,
+                         insertbackground=COL_CHATBOT, font=("Courier New", 9),
+                         relief="flat", bd=0, wrap="word",
+                         highlightbackground=COL_CHATBOT, highlightthickness=1,
+                         padx=6, pady=4)
+    chat_input.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    def _send():
+        msg = chat_input.get("1.0", "end").strip()
+        if not msg: return
+        chat_input.delete("1.0", "end")
+        _append_chat("You", msg, "#60a5fa")
+        threading.Thread(target=_call_claude_api, args=(msg,), daemon=True).start()
+
+    def _enter_key(event):
+        if not (event.state & 0x1):  # no Shift
+            _send()
+            return "break"
+
+    chat_input.bind("<Return>", _enter_key)
+
+    send_btn2 = tk.Button(input_area, text="Send\n↵", command=_send,
+                          bg="#4f46e5", fg="#fff",
+                          activebackground="#6d28d9", activeforeground="#fff",
+                          font=("Courier New", 8, "bold"), relief="flat",
+                          bd=0, cursor="hand2", padx=10, pady=6)
+    send_btn2.pack(side="left")
+
+    # Hint
+    tk.Label(input_area, text="Shift+Enter = newline", bg="#0e0b1e", fg="#2d3f5e",
+             font=("Courier New", 7)).pack(side="left", padx=6)
+
+    # ESC to close
+    popup.bind("<Escape>", lambda e: _close_popup())
+
+    def _do_clear():
+        global chatbot_history
+        chatbot_history = []
+        chat_display.config(state="normal")
+        chat_display.delete("1.0", "end")
+        chat_display.insert("end",
+            "CBM·AI Assistant ready.\n"
+            "Ask me anything about the app, your data, or the analysis results.\n\n"
+            "Examples:\n"
+            "  • Why is well X anomalous?\n"
+            "  • What does the cluster analysis tell me?\n"
+            "  • How does Isolation Forest work?\n"
+            "  • What file formats are supported?\n"
+        )
+        chat_display.config(state="disabled")
+
+    _do_clear()
+    _chat_popup = popup
+    popup.withdraw()  # hidden initially
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1926,7 +2099,7 @@ tk.Frame(sidebar,bg=SIDEBAR,height=20).pack()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RIGHT PANEL — TABS + CHATBOT
+# RIGHT PANEL — TABS (no embedded chatbot)
 # ══════════════════════════════════════════════════════════════════════════════
 rp_outer,right_inner=make_scrollable(root_pane,bg=BG)
 root_pane.add(rp_outer,minsize=900)
@@ -1997,79 +2170,22 @@ explain_xsb.config(command=explain_text.xview); explain_vsb.config(command=expla
 explain_vsb.pack(side="right",fill="y"); explain_xsb.pack(side="bottom",fill="x")
 explain_text.pack(side="left",fill="both",expand=True)
 
-# ── AI CHATBOT ────────────────────────────────────────────────────────────────
-chat_wrap=tk.Frame(right_inner,bg=BG,padx=10,pady=6); chat_wrap.pack(fill="x")
-chat_hdr=tk.Frame(chat_wrap,bg=BG,pady=4); chat_hdr.pack(fill="x")
-tk.Label(chat_hdr,text="★ AI Assistant  (Claude-powered CBM Chatbot)",
-         bg=BG,fg=COL_CHATBOT,font=FONT_H2).pack(side="left")
-tk.Button(chat_hdr,text="Clear Chat",command=clear_chat,
-          bg=CARD2,fg=FG_DIM,activebackground=BORDER,activeforeground=FG,
-          font=FONT_XS,relief="flat",bd=0,cursor="hand2",padx=10,pady=4).pack(side="right")
-
-chat_outer=tk.Frame(chat_wrap,bg=CARD,highlightbackground=COL_CHATBOT,highlightthickness=1)
-chat_outer.pack(fill="x")
-
-chat_display_frame=tk.Frame(chat_outer,bg=CARD)
-chat_display_frame.pack(fill="both",expand=True)
-chat_vsb=tk_ttk.Scrollbar(chat_display_frame,orient="vertical")
-chat_display=tk.Text(chat_display_frame,height=16,bg=CARD,fg=FG,
-                     font=("Courier New",9),relief="flat",bd=0,padx=12,pady=8,
-                     wrap="word",yscrollcommand=chat_vsb.set,
-                     highlightthickness=0,state="disabled")
-chat_vsb.config(command=chat_display.yview)
-chat_vsb.pack(side="right",fill="y"); chat_display.pack(side="left",fill="both",expand=True)
-
-chat_input_frame=tk.Frame(chat_outer,bg=CARD2,pady=6,padx=6)
-chat_input_frame.pack(fill="x")
-
-chat_input_label=tk.Label(chat_input_frame,text="Ask:",bg=CARD2,fg=COL_CHATBOT,font=FONT_H3)
-chat_input_label.pack(side="left",padx=(0,6))
-chat_input=tk.Text(chat_input_frame,height=3,bg=CARD,fg=FG,insertbackground=FG,
-                   font=("Courier New",9),relief="flat",bd=2,wrap="word",
-                   highlightbackground=COL_CHATBOT,highlightthickness=1)
-chat_input.pack(side="left",fill="x",expand=True,padx=(0,6))
-
-def _on_enter(event):
-    if not event.state & 0x1:  # no shift held
-        send_chat_message()
-        return "break"
-chat_input.bind("<Return>", _on_enter)
-
-send_btn=tk.Button(chat_input_frame,text="Send\n(Enter)",command=send_chat_message,
-                   bg="#4f46e5",fg="#fff",activebackground=_lighten("#4f46e5"),activeforeground="#fff",
-                   font=FONT_XS,relief="flat",bd=0,cursor="hand2",padx=10,pady=6)
-send_btn.pack(side="left")
-
-tk.Label(chat_input_frame,text="Shift+Enter=newline",bg=CARD2,fg=FG_DIM,font=("Courier New",7)).pack(side="left",padx=6)
-
 tk.Frame(right_inner,bg=BG,height=20).pack()
-
-# Initialise chatbot display
-clear_chat()
 
 # Initial insights text
 explain_text.config(state="normal")
 explain_text.insert("end",
     "============================================================\n"
-    "  CBM AI Analytics Platform  v7.0\n"
-    "  Enhanced Hidden Pattern Explanations + AI Chatbot\n"
+    "  CBM AI Analytics Platform  v7.0  (Floating Chatbot Edition)\n"
     "============================================================\n\n"
-    "  WHAT'S NEW IN v7.0:\n"
+    "  AI CHATBOT — NOW A FLOATING ICON\n"
     "  ----------------------------------------------------------\n"
-    "  ✔ REMOVED tabs: Parameter Weights, RPM Status,\n"
-    "                  Param Anomaly, Similarity\n\n"
-    "  ✔ ENHANCED HIDDEN PATTERN INSIGHTS:\n"
-    "     For each anomalous well:\n"
-    "     • Which parameters are out of range\n"
-    "     • Exact z-scores (e.g. z=+3.8σ above mean)\n"
-    "     • Fleet average vs well value comparison\n"
-    "     • P10–P90 normal range\n"
-    "     • Plain-English explanation of WHY\n"
-    "     • Cluster membership of anomalous well\n\n"
-    "  ✔ AI CHATBOT (Claude-powered):\n"
-    "     Ask questions about the app or analysis results.\n"
-    "     The chatbot receives the full insights report\n"
-    "     as context and answers specific questions.\n\n"
+    "  ★ Click the  ★ AI  button (bottom-right corner) to open\n"
+    "    the AI Assistant in a compact floating panel.\n\n"
+    "  • Drag the panel by its title bar to reposition it\n"
+    "  • Press ESC or ✕ to close\n"
+    "  • The chatbot receives your full analysis report as context\n"
+    "  • Ask anything about wells, clusters, anomalies, or the app\n\n"
     "  QUICK START:\n"
     "  ----------------------------------------------------------\n"
     "  1. Upload data file  (any format)\n"
@@ -2077,9 +2193,66 @@ explain_text.insert("end",
     "  3. Set cluster count + anomaly contamination %\n"
     "  4. Click Run AI Analysis\n"
     "  5. Read per-well explanations in Insights Report\n"
-    "  6. Ask the AI Chatbot for deeper analysis\n"
+    "  6. Click  ★ AI  to ask the chatbot deeper questions\n"
     "============================================================\n"
 )
 explain_text.config(state="disabled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLOATING ACTION BUTTON (FAB) — AI Chatbot icon
+# Placed as an overlay on the app root window, bottom-right corner
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Build the popup first (hidden), then show the FAB
+_build_chat_popup()
+
+# FAB container — we use a Toplevel anchored to the app so it stays on top
+# but moves with the window
+fab_frame = tk.Frame(app, bg=BG_DEEP)
+fab_frame.place(relx=1.0, rely=1.0, x=-16, y=-16, anchor="se")
+
+# Tooltip label above FAB
+fab_tip_var = tk.StringVar(value="")
+fab_tip_lbl = tk.Label(fab_frame, textvariable=fab_tip_var,
+                       bg="#150a2e", fg=COL_CHATBOT,
+                       font=("Courier New", 8), padx=6, pady=3,
+                       relief="flat", bd=0)
+
+chat_fab_btn = tk.Button(
+    fab_frame,
+    text="★ AI",
+    command=toggle_chat_popup,
+    bg="#4f46e5", fg="#ffffff",
+    activebackground="#7c3aed", activeforeground="#ffffff",
+    font=("Georgia", 11, "bold"),
+    relief="flat", bd=0,
+    cursor="hand2",
+    padx=16, pady=12,
+    width=6
+)
+chat_fab_btn.pack(side="bottom")
+
+# Hover tooltip
+def _fab_enter(e):
+    fab_tip_var.set("AI Assistant")
+    fab_tip_lbl.pack(side="top", pady=(0,4))
+def _fab_leave(e):
+    fab_tip_lbl.pack_forget()
+
+chat_fab_btn.bind("<Enter>", _fab_enter)
+chat_fab_btn.bind("<Leave>", _fab_leave)
+Tooltip(chat_fab_btn, "Click to open/close the AI Assistant chat panel")
+
+# Start pulse animation
+app.after(1000, _pulse_icon)
+
+# Keep FAB on top and re-raise whenever focus changes
+def _keep_fab_top(e=None):
+    try:
+        fab_frame.lift()
+    except: pass
+app.bind("<FocusIn>", _keep_fab_top)
+app.bind("<Configure>", _keep_fab_top)
 
 app.mainloop()
